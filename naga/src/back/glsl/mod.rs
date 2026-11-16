@@ -14,6 +14,7 @@ to output a [`Module`](crate::Module) into glsl
 - 450
 
 ### ES
+- 100 (OpenGL ES 2.0 shader features only)
 - 300
 - 310
 
@@ -236,6 +237,8 @@ pub struct ReflectionInfo {
     pub texture_mapping: crate::FastHashMap<String, TextureMapping>,
     /// Mapping between uniform variables and names.
     pub uniforms: crate::FastHashMap<Handle<crate::GlobalVariable>, String>,
+    /// Individual values of uniform buffers lowered to ordinary uniforms in GLSL ES 1.00.
+    pub plain_uniforms: crate::FastHashMap<Handle<crate::GlobalVariable>, Vec<ImmediateItem>>,
     /// Mapping between names and attribute locations.
     pub varying: crate::FastHashMap<String, VaryingLocation>,
     /// List of immediate data items in the shader.
@@ -330,6 +333,7 @@ impl IdGenerator {
 struct VaryingOptions {
     output: bool,
     targeting_webgl: bool,
+    targeting_gles2: bool,
     draw_parameters: bool,
 }
 
@@ -338,6 +342,7 @@ impl VaryingOptions {
         Self {
             output,
             targeting_webgl: options.version.is_webgl(),
+            targeting_gles2: matches!(options.version, Version::Embedded { version: 100, .. }),
             draw_parameters: options.writer_flags.contains(WriterFlags::DRAW_PARAMETERS),
         }
     }
@@ -358,6 +363,13 @@ struct VaryingName<'a> {
 impl fmt::Display for VaryingName<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self.binding {
+            crate::Binding::Location { location: 0, .. }
+                if self.stage == ShaderStage::Fragment
+                    && self.options.output
+                    && self.options.targeting_gles2 =>
+            {
+                write!(f, "gl_FragColor")
+            }
             crate::Binding::Location {
                 blend_src: Some(1), ..
             } => {

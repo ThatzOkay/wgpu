@@ -1040,6 +1040,10 @@ fn set_index_buffer(
 ) -> Result<(), RenderBundleErrorInner> {
     buffer.check_is_valid()?;
 
+    if state.device.is_gles2() && index_format == wgt::IndexFormat::Uint32 {
+        return Err(RenderCommandError::Unimplemented("32-bit indices on GLES 2.0").into());
+    }
+
     state
         .trackers
         .buffers

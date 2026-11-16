@@ -2182,6 +2182,25 @@ impl Texture {
             }
         };
 
+        if device.is_gles2() {
+            if matches!(
+                resolved_dimension,
+                wgt::TextureViewDimension::D2Array | wgt::TextureViewDimension::CubeArray
+            ) {
+                return Err(CreateTextureViewError::UnsupportedOnGles2(
+                    "array texture views",
+                ));
+            }
+            if resolved_usage.contains(wgt::TextureUsages::TEXTURE_BINDING)
+                && (desc.range.base_mip_level != 0
+                    || resolved_mip_level_count != self.desc.mip_level_count)
+            {
+                return Err(CreateTextureViewError::UnsupportedOnGles2(
+                    "sampled views with a restricted mip range",
+                ));
+            }
+        }
+
         let format_features = device.describe_format_features(resolved_format)?;
         let allowed_format_usages = format_features.allowed_usages;
         if resolved_usage.contains(wgt::TextureUsages::RENDER_ATTACHMENT)
@@ -2646,6 +2665,8 @@ impl WebGpuError for TextureDimensionError {
 #[derive(Clone, Debug, Error)]
 #[non_exhaustive]
 pub enum CreateTextureError {
+    #[error("GLES 2.0 does not support {0}")]
+    UnsupportedOnGles2(&'static str),
     #[error(transparent)]
     Device(#[from] DeviceError),
     #[error(transparent)]
@@ -2741,6 +2762,7 @@ impl WebGpuError for CreateTextureError {
             Self::MissingDownlevelFlags(e) => e.webgpu_error_type(),
 
             Self::InvalidUsage(_)
+            | Self::UnsupportedOnGles2(_)
             | Self::InvalidDepthDimension(_, _)
             | Self::InvalidCompressedDimension(_, _)
             | Self::InvalidMipLevelCount { .. }
@@ -2959,6 +2981,8 @@ impl TextureView {
 #[derive(Clone, Debug, Error)]
 #[non_exhaustive]
 pub enum CreateTextureViewError {
+    #[error("GLES 2.0 does not support {0}")]
+    UnsupportedOnGles2(&'static str),
     #[error(transparent)]
     Device(#[from] DeviceError),
     #[error(transparent)]
@@ -3070,6 +3094,7 @@ impl WebGpuError for CreateTextureViewError {
             Self::Device(e) => e.webgpu_error_type(),
 
             Self::InvalidTextureViewDimension { .. }
+            | Self::UnsupportedOnGles2(_)
             | Self::InvalidResource(_)
             | Self::InvalidMultisampledTextureViewDimension(_)
             | Self::InvalidCubemapTextureDepth { .. }
@@ -3336,6 +3361,8 @@ impl fmt::Debug for SamplerFilterErrorType {
 #[derive(Clone, Debug, Error)]
 #[non_exhaustive]
 pub enum CreateSamplerError {
+    #[error("GLES 2.0 does not support {0}")]
+    UnsupportedOnGles2(&'static str),
     #[error(transparent)]
     Device(#[from] DeviceError),
     #[error("Invalid lodMinClamp: {0}. Must be greater or equal to 0.0")]
@@ -3376,6 +3403,7 @@ impl WebGpuError for CreateSamplerError {
             Self::MissingFeatures(e) => e.webgpu_error_type(),
 
             Self::InvalidLodMinClamp(_)
+            | Self::UnsupportedOnGles2(_)
             | Self::InvalidLodMaxClamp { .. }
             | Self::InvalidAnisotropy(_)
             | Self::InvalidFilterModeWithAnisotropy { .. }
@@ -3387,6 +3415,8 @@ impl WebGpuError for CreateSamplerError {
 #[derive(Clone, Debug, Error)]
 #[non_exhaustive]
 pub enum CreateQuerySetError {
+    #[error("GLES 2.0 does not support queries")]
+    UnsupportedOnGles2,
     #[error(transparent)]
     Device(#[from] DeviceError),
     #[error("QuerySets cannot be made with zero queries")]
@@ -3403,7 +3433,9 @@ impl WebGpuError for CreateQuerySetError {
             Self::Device(e) => e.webgpu_error_type(),
             Self::MissingFeatures(e) => e.webgpu_error_type(),
 
-            Self::TooManyQueries { .. } | Self::ZeroCount => ErrorType::Validation,
+            Self::TooManyQueries { .. } | Self::ZeroCount | Self::UnsupportedOnGles2 => {
+                ErrorType::Validation
+            }
         }
     }
 }

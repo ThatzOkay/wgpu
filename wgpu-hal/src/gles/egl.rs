@@ -632,9 +632,19 @@ impl Inner {
                 create_context(khronos_egl::OPENGL_ES_API, &gles_context_attributes)
             };
 
+            let result = result.or_else(|error| {
+                if force_gles_minor_version != wgt::Gles3MinorVersion::Automatic {
+                    return Err(error);
+                }
+                log::debug!("Failed to create GLES 3.x context: {error}, falling back to GLES 2.0");
+                create_context(
+                    khronos_egl::OPENGL_ES_API,
+                    &[khronos_egl::CONTEXT_CLIENT_VERSION, 2],
+                )
+            });
             result.map_err(|e| {
                 crate::InstanceError::with_source(
-                    String::from("unable to create OpenGL or GLES 3.x context"),
+                    String::from("unable to create OpenGL or GLES context"),
                     e,
                 )
             })
@@ -1057,7 +1067,7 @@ impl crate::Instance for Instance {
 
         // In contrast to OpenGL ES, OpenGL requires explicitly enabling sRGB conversions,
         // as otherwise the user has to do the sRGB conversion.
-        if !matches!(inner.srgb_kind, SrgbFrameBufferKind::None) {
+        if !gl.version().is_embedded && !matches!(inner.srgb_kind, SrgbFrameBufferKind::None) {
             unsafe { gl.enable(glow::FRAMEBUFFER_SRGB) };
         }
 
@@ -1137,7 +1147,8 @@ pub struct Swapchain {
     surface: khronos_egl::Surface,
     wl_window: Option<*mut ffi::c_void>,
     framebuffer: glow::Framebuffer,
-    renderbuffer: glow::Renderbuffer,
+    image: super::TextureInner,
+    presenter: Option<super::legacy::Presenter>,
     /// Extent because the window lies
     extent: wgt::Extent3d,
     format: wgt::TextureFormat,
@@ -1190,39 +1201,44 @@ impl Surface {
         unsafe { gl.disable(glow::SCISSOR_TEST) };
         unsafe { gl.color_mask(true, true, true, true) };
 
-        unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None) };
-        unsafe { gl.draw_buffers(&[glow::BACK]) };
-        unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(sc.framebuffer)) };
+        if let Some(presenter) = &sc.presenter {
+            let (texture, _) = sc.image.as_native();
+            unsafe { presenter.draw(&gl, texture, sc.extent) };
+        } else {
+            unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None) };
+            unsafe { gl.draw_buffers(&[glow::BACK]) };
+            unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(sc.framebuffer)) };
 
-        if !matches!(self.srgb_kind, SrgbFrameBufferKind::None) {
-            // Disable sRGB conversions for `glBlitFramebuffer` as behavior does diverge between
-            // drivers and formats otherwise and we want to ensure no sRGB conversions happen.
-            unsafe { gl.disable(glow::FRAMEBUFFER_SRGB) };
+            if !matches!(self.srgb_kind, SrgbFrameBufferKind::None) {
+                // Disable sRGB conversions for `glBlitFramebuffer` as behavior does diverge between
+                // drivers and formats otherwise and we want to ensure no sRGB conversions happen.
+                unsafe { gl.disable(glow::FRAMEBUFFER_SRGB) };
+            }
+
+            // Note the Y-flipping here. GL's presentation is not flipped,
+            // but main rendering is. Therefore, we Y-flip the output positions
+            // in the shader, and also this blit.
+            unsafe {
+                gl.blit_framebuffer(
+                    0,
+                    sc.extent.height as i32,
+                    sc.extent.width as i32,
+                    0,
+                    0,
+                    0,
+                    sc.extent.width as i32,
+                    sc.extent.height as i32,
+                    glow::COLOR_BUFFER_BIT,
+                    glow::NEAREST,
+                )
+            };
+
+            if !matches!(self.srgb_kind, SrgbFrameBufferKind::None) {
+                unsafe { gl.enable(glow::FRAMEBUFFER_SRGB) };
+            }
+
+            unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
         }
-
-        // Note the Y-flipping here. GL's presentation is not flipped,
-        // but main rendering is. Therefore, we Y-flip the output positions
-        // in the shader, and also this blit.
-        unsafe {
-            gl.blit_framebuffer(
-                0,
-                sc.extent.height as i32,
-                sc.extent.width as i32,
-                0,
-                0,
-                0,
-                sc.extent.width as i32,
-                sc.extent.height as i32,
-                glow::COLOR_BUFFER_BIT,
-                glow::NEAREST,
-            )
-        };
-
-        if !matches!(self.srgb_kind, SrgbFrameBufferKind::None) {
-            unsafe { gl.enable(glow::FRAMEBUFFER_SRGB) };
-        }
-
-        unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
 
         match self.swap_buffers_with_damage {
             Some(swap_with_damage) if !damage_rects.is_empty() => {
@@ -1280,7 +1296,16 @@ impl Surface {
         let gl = &device.shared.context.lock();
         match self.swapchain.write().take() {
             Some(sc) => {
-                unsafe { gl.delete_renderbuffer(sc.renderbuffer) };
+                match sc.image {
+                    super::TextureInner::Renderbuffer { raw } => unsafe {
+                        gl.delete_renderbuffer(raw)
+                    },
+                    super::TextureInner::Texture { raw, .. } => unsafe { gl.delete_texture(raw) },
+                    _ => unreachable!(),
+                }
+                if let Some(presenter) = sc.presenter {
+                    unsafe { presenter.destroy(gl) };
+                }
                 unsafe { gl.delete_framebuffer(sc.framebuffer) };
                 Some((sc.surface, sc.wl_window))
             }
@@ -1461,40 +1486,75 @@ impl crate::Surface for Surface {
 
         let format_desc = device.shared.describe_texture_format(config.format);
         let gl = &device.shared.context.lock();
-        let renderbuffer = unsafe { gl.create_renderbuffer() }.map_err(|error| {
-            log::error!("Internal swapchain renderbuffer creation failed: {error}");
-            crate::DeviceError::OutOfMemory
-        })?;
-        unsafe { gl.bind_renderbuffer(glow::RENDERBUFFER, Some(renderbuffer)) };
-        unsafe {
-            gl.renderbuffer_storage(
-                glow::RENDERBUFFER,
-                format_desc.internal,
-                config.extent.width as _,
-                config.extent.height as _,
-            )
+        let framebuffer =
+            unsafe { gl.create_framebuffer() }.map_err(|_| crate::DeviceError::OutOfMemory)?;
+        let target = if device.shared.is_gles2() {
+            glow::FRAMEBUFFER
+        } else {
+            glow::READ_FRAMEBUFFER
         };
-        let framebuffer = unsafe { gl.create_framebuffer() }.map_err(|error| {
-            log::error!("Internal swapchain framebuffer creation failed: {error}");
-            crate::DeviceError::OutOfMemory
-        })?;
-        unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer)) };
-        unsafe {
-            gl.framebuffer_renderbuffer(
-                glow::READ_FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::RENDERBUFFER,
-                Some(renderbuffer),
+        unsafe { gl.bind_framebuffer(target, Some(framebuffer)) };
+        let (image, presenter) = if device.shared.is_gles2() {
+            let raw =
+                unsafe { gl.create_texture() }.map_err(|_| crate::DeviceError::OutOfMemory)?;
+            unsafe {
+                gl.bind_texture(glow::TEXTURE_2D, Some(raw));
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA as i32,
+                    config.extent.width as i32,
+                    config.extent.height as i32,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(None),
+                );
+                gl.framebuffer_texture_2d(
+                    target,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(raw),
+                    0,
+                );
+            }
+            let presenter = unsafe { super::legacy::Presenter::new(gl) }?;
+            (
+                super::TextureInner::Texture {
+                    raw,
+                    target: glow::TEXTURE_2D,
+                },
+                Some(presenter),
             )
+        } else {
+            let raw =
+                unsafe { gl.create_renderbuffer() }.map_err(|_| crate::DeviceError::OutOfMemory)?;
+            unsafe {
+                gl.bind_renderbuffer(glow::RENDERBUFFER, Some(raw));
+                gl.renderbuffer_storage(
+                    glow::RENDERBUFFER,
+                    format_desc.internal,
+                    config.extent.width as i32,
+                    config.extent.height as i32,
+                );
+                gl.framebuffer_renderbuffer(
+                    target,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::RENDERBUFFER,
+                    Some(raw),
+                );
+                gl.bind_renderbuffer(glow::RENDERBUFFER, None);
+            }
+            (super::TextureInner::Renderbuffer { raw }, None)
         };
-        unsafe { gl.bind_renderbuffer(glow::RENDERBUFFER, None) };
-        unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
+        unsafe { gl.bind_framebuffer(target, None) };
 
         let mut swapchain = self.swapchain.write();
         *swapchain = Some(Swapchain {
             surface,
             wl_window,
-            renderbuffer,
+            image,
+            presenter,
             framebuffer,
             extent: config.extent,
             format: config.format,
@@ -1532,9 +1592,7 @@ impl crate::Surface for Surface {
             "Surface has no swap-chain configured",
         ))?;
         let texture = super::Texture {
-            inner: super::TextureInner::Renderbuffer {
-                raw: sc.renderbuffer,
-            },
+            inner: sc.image.clone(),
             drop_guard: None,
             array_layer_count: 1,
             mip_level_count: 1,

@@ -703,6 +703,153 @@ fn incompatible_interpolation_and_sampling_types() {
 }
 
 #[test]
+fn gles2_uniform_layout() {
+    let source = "
+        struct Element { @size(16) value: f32 }
+        struct Uniforms {
+            @size(32) head: vec4<f32>,
+            values: array<Element, 2>,
+            tail: vec4<f32>,
+        }
+        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+        @fragment fn main() -> @location(0) vec4<f32> {
+            return uniforms.head + uniforms.tail + uniforms.values[1].value;
+        }";
+    let (_, reflection) = generate_gles2(source, false).unwrap();
+    let items = reflection.plain_uniforms.values().next().unwrap();
+    assert_eq!(
+        items.iter().map(|item| item.offset).collect::<Vec<_>>(),
+        [0, 32, 48, 64]
+    );
+    assert_eq!(
+        items.iter().map(|item| item.size_bytes).collect::<Vec<_>>(),
+        [16, 4, 4, 16]
+    );
+}
+
+fn generate_gles2(
+    source: &str,
+    webgl: bool,
+) -> Result<(String, naga::back::glsl::ReflectionInfo), naga::back::glsl::Error> {
+    use naga::back::glsl;
+    let module = naga::front::wgsl::parse_str(source).unwrap();
+    let info = naga::valid::Validator::new(Default::default(), Default::default())
+        .validate(&module)
+        .unwrap();
+    let options = glsl::Options {
+        version: glsl::Version::Embedded {
+            version: 100,
+            is_webgl: webgl,
+        },
+        ..Default::default()
+    };
+    let pipeline = glsl::PipelineOptions {
+        shader_stage: module.entry_points[0].stage,
+        entry_point: "main".into(),
+        multiview: None,
+    };
+    let mut output = String::new();
+    let reflection = glsl::Writer::new(
+        &mut output,
+        &module,
+        &info,
+        &options,
+        &pipeline,
+        Default::default(),
+    )?
+    .write()?;
+    Ok((output, reflection))
+}
+
+#[test]
+fn gles2_rejects_unsupported_shader_features() {
+    for source in [
+        "@fragment fn main() -> @location(0) vec4<f32> { let x = 1u; return vec4<f32>(f32(x)); }",
+        "@fragment fn main(@location(0) x: f32) -> @location(0) vec4<f32> { return vec4<f32>(dpdx(x)); }",
+        "@vertex fn main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> { return vec4<f32>(f32(index)); }",
+        "@group(0) @binding(0) var<uniform> x: i32; @fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(f32(x & 1)); }",
+        "struct Output { @location(0) a: vec4<f32>, @location(1) b: vec4<f32> } @fragment fn main() -> Output { return Output(vec4<f32>(0.0), vec4<f32>(1.0)); }",
+        "@fragment fn main(@location(0) @interpolate(flat) x: f32) -> @location(0) vec4<f32> { return vec4<f32>(x); }",
+        "@group(0) @binding(0) var t: texture_2d<f32>; @group(0) @binding(1) var s: sampler; @fragment fn main() -> @location(0) vec4<f32> { return textureSampleLevel(t, s, vec2<f32>(0.0), 0.0); }",
+    ] {
+        let error = generate_gles2(source, false).unwrap_err();
+        assert!(error.to_string().contains("GLSL ES 1.00"), "{error}");
+    }
+}
+
+#[test]
+fn gles2_webgl_qualifiers() {
+    let (output, _) = generate_gles2("@vertex fn main(@location(0) pos: vec2<f32>) -> @builtin(position) vec4<f32> { return vec4<f32>(pos, 0.0, 1.0); }", true).unwrap();
+    assert!(output.starts_with("#version 100\n"));
+    assert!(output.contains("attribute vec2 "));
+    assert!(!output.contains("layout("));
+}
+
+#[test]
+fn gles2_texture_sampling() {
+    use naga::back::glsl;
+
+    for (dimension, coordinate, function) in [
+        ("2d", "vec2<f32>(0.0)", "texture2D"),
+        ("cube", "vec3<f32>(1.0)", "textureCube"),
+    ] {
+        for (sample, suffix) in [
+            (format!("textureSample(t, s, {coordinate})"), ""),
+            (format!("textureSampleBias(t, s, {coordinate}, 1.0)"), ""),
+            (
+                format!("textureSampleLevel(t, s, {coordinate}, 0.0)"),
+                "Lod",
+            ),
+        ] {
+            let stage = if suffix.is_empty() {
+                "fragment"
+            } else {
+                "vertex"
+            };
+            let output = if suffix.is_empty() {
+                "@location(0)"
+            } else {
+                "@builtin(position)"
+            };
+            let source = format!(
+                "@group(0) @binding(0) var t: texture_{dimension}<f32>;
+                 @group(0) @binding(1) var s: sampler;
+                 @{stage} fn main() -> {output} vec4<f32> {{ return {sample}; }}"
+            );
+            let module = naga::front::wgsl::parse_str(&source).unwrap();
+            let info = naga::valid::Validator::new(Default::default(), Default::default())
+                .validate(&module)
+                .unwrap();
+            for version in [100, 300] {
+                let options = glsl::Options {
+                    version: glsl::Version::new_gles(version),
+                    ..Default::default()
+                };
+                let pipeline = glsl::PipelineOptions {
+                    shader_stage: module.entry_points[0].stage,
+                    entry_point: "main".into(),
+                    multiview: None,
+                };
+                let mut text = String::new();
+                glsl::Writer::new(
+                    &mut text,
+                    &module,
+                    &info,
+                    &options,
+                    &pipeline,
+                    Default::default(),
+                )
+                .unwrap()
+                .write()
+                .unwrap();
+                let expected = if version == 100 { function } else { "texture" };
+                assert!(text.contains(&format!("{expected}{suffix}(")), "{text}");
+            }
+        }
+    }
+}
+
+#[test]
 fn no_flat_first_in_glsl() {
     use dummy_interpolation_shader::DummyInterpolationShader;
 

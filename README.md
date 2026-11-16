@@ -79,6 +79,10 @@ Contributors are welcome! See [CONTRIBUTING.md][contrib] for more information.
 🌋 = Requires the [MoltenVK](https://vulkan.lunarg.com/sdk/home#mac) translation layer  
 🛠️ = Unsupported, though open to contributions
 
+Native EGL also supports a restricted GLES 2.0 rendering profile. See the
+[GLES 2.0 example](examples/standalone/04_gles2/README.md) for limits, shader
+restrictions, and a rendering and presentation smoke test.
+
 ## Environment Variables
 
 Testing, examples, and `::from_env()` methods use a standardized set of environment variables to control wgpu's behavior.
