@@ -718,6 +718,32 @@ impl Limits {
         }
     }
 
+    /// Conservative limits for the GLES 2.0 backend.
+    ///
+    /// Uniform buffers are uploaded through ordinary uniforms. Shaders must use
+    /// GLSL ES 1.00-compatible features, floating-point vertex attributes, and
+    /// a single color attachment. Compute and storage resources are unavailable.
+    #[must_use]
+    pub const fn downlevel_gles2_defaults() -> Self {
+        Self {
+            max_texture_dimension_1d: 64,
+            max_texture_dimension_2d: 64,
+            max_texture_dimension_3d: 0,
+            max_texture_array_layers: 6,
+            max_sampled_textures_per_shader_stage: 8,
+            max_samplers_per_shader_stage: 8,
+            max_uniform_buffers_per_shader_stage: 8,
+            max_dynamic_uniform_buffers_per_pipeline_layout: 8,
+            max_uniform_buffer_binding_size: 256,
+            max_vertex_buffers: 8,
+            max_vertex_attributes: 8,
+            max_inter_stage_shader_variables: 8,
+            max_color_attachments: 1,
+            max_color_attachment_bytes_per_sample: 16,
+            ..Self::downlevel_webgl2_defaults()
+        }
+    }
+
     /// Sets each limit to `i32::MAX` (or 1, in the case of lower-is-better limits).
     ///
     /// These values do not reflect the capabilities of any actual device. They are

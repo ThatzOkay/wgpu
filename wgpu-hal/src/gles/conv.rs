@@ -28,6 +28,7 @@ impl super::AdapterShared {
             Tf::Rg16Unorm => (glow::RG16, glow::RG, glow::UNSIGNED_SHORT),
             Tf::Rg16Snorm => (glow::RG16_SNORM, glow::RG, glow::SHORT),
             Tf::Rg16Float => (glow::RG16F, glow::RG, glow::HALF_FLOAT),
+            Tf::Rgba8Unorm if self.is_gles2() => (glow::RGBA, glow::RGBA, glow::UNSIGNED_BYTE),
             Tf::Rgba8Unorm => (glow::RGBA8, glow::RGBA, glow::UNSIGNED_BYTE),
             Tf::Rgba8UnormSrgb => (glow::SRGB8_ALPHA8, glow::RGBA, glow::UNSIGNED_BYTE),
             Tf::Bgra8UnormSrgb => (glow::SRGB8_ALPHA8, glow::BGRA, glow::UNSIGNED_BYTE), //TODO?

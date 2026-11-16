@@ -86,6 +86,12 @@ impl super::Queue {
     }
 
     unsafe fn reset_state(&self, gl: &glow::Context) {
+        if self.shared.is_gles2() {
+            *self.legacy_state.lock() = Default::default();
+            for index in 0..self.shared.limits.max_vertex_attributes {
+                unsafe { gl.disable_vertex_attrib_array(index) };
+            }
+        }
         unsafe { gl.use_program(None) };
         unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
         unsafe { gl.disable(glow::DEPTH_TEST) };
@@ -189,13 +195,51 @@ impl super::Queue {
         }
     }
 
-    unsafe fn process(
+    pub(super) unsafe fn process(
         &self,
         gl: &glow::Context,
         command: &C,
         #[cfg_attr(target_family = "wasm", allow(unused))] data_bytes: &[u8],
         queries: &[glow::Query],
     ) {
+        if self.shared.is_gles2() {
+            match command {
+                C::Draw { .. } | C::DrawIndexed { .. } => unsafe { self.prepare_gles2_draw(gl) },
+                C::ClearBuffer { dst, range, .. } => {
+                    let zeroes = vec![0; (range.end - range.start) as usize];
+                    unsafe { self.write_gles2_buffer(gl, dst, range.start as usize, &zeroes) };
+                    return;
+                }
+                C::CopyBufferToBuffer { src, dst, copy, .. } => {
+                    let data = src.map_state.lock().data.as_ref().unwrap()
+                        [copy.src_offset as usize..(copy.src_offset + copy.size.get()) as usize]
+                        .to_vec();
+                    unsafe { self.write_gles2_buffer(gl, dst, copy.dst_offset as usize, &data) };
+                    return;
+                }
+                C::CopyBufferToTexture {
+                    src,
+                    dst,
+                    dst_target,
+                    copy,
+                    ..
+                } => {
+                    unsafe { self.copy_gles2_texture(gl, src, *dst, *dst_target, copy, true) };
+                    return;
+                }
+                C::CopyTextureToBuffer {
+                    src,
+                    src_target,
+                    dst,
+                    copy,
+                    ..
+                } => {
+                    unsafe { self.copy_gles2_texture(gl, dst, *src, *src_target, copy, false) };
+                    return;
+                }
+                _ => {}
+            }
+        }
         match *command {
             C::Draw {
                 topology,
@@ -210,7 +254,13 @@ impl super::Queue {
                     .private_caps
                     .contains(PrivateCapabilities::FULLY_FEATURED_INSTANCING);
 
-                if supports_full_instancing {
+                if self.shared.is_gles2() {
+                    for _ in 0..instance_count {
+                        unsafe {
+                            gl.draw_arrays(topology, first_vertex as i32, vertex_count as i32)
+                        };
+                    }
+                } else if supports_full_instancing {
                     unsafe {
                         gl.draw_arrays_instanced_base_instance(
                             topology,
@@ -253,7 +303,17 @@ impl super::Queue {
                     .private_caps
                     .contains(PrivateCapabilities::FULLY_FEATURED_INSTANCING);
 
-                if supports_full_instancing {
+                if self.shared.is_gles2() {
+                    unsafe {
+                        self.draw_gles2_indexed(
+                            gl,
+                            topology,
+                            index_count,
+                            index_offset as u32,
+                            instance_count,
+                        )
+                    };
+                } else if supports_full_instancing {
                     unsafe {
                         gl.draw_elements_instanced_base_vertex_base_instance(
                             topology,
@@ -723,7 +783,7 @@ impl super::Queue {
                 dst_target,
                 ref copy,
             } => {
-                unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.copy_fbo)) };
+                unsafe { gl.bind_framebuffer(self.read_framebuffer(), Some(self.copy_fbo)) };
                 unsafe { gl.bind_texture(dst_target, Some(dst)) };
 
                 // The read framebuffer holds a single 2D slice at a time, so a copy of
@@ -733,7 +793,7 @@ impl super::Queue {
                         //TODO: handle GLES without framebuffer_texture_3d
                         unsafe {
                             gl.framebuffer_texture_layer(
-                                glow::READ_FRAMEBUFFER,
+                                self.read_framebuffer(),
                                 glow::COLOR_ATTACHMENT0,
                                 Some(src),
                                 copy.src_base.mip_level as i32,
@@ -743,7 +803,7 @@ impl super::Queue {
                     } else {
                         unsafe {
                             gl.framebuffer_texture_2d(
-                                glow::READ_FRAMEBUFFER,
+                                self.read_framebuffer(),
                                 glow::COLOR_ATTACHMENT0,
                                 get_2d_target(src_target, copy.src_base.array_layer + z),
                                 Some(src),
@@ -949,7 +1009,7 @@ impl super::Queue {
                     .rows_per_image
                     .unwrap_or(copy.size.height);
 
-                unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.copy_fbo)) };
+                unsafe { gl.bind_framebuffer(self.read_framebuffer(), Some(self.copy_fbo)) };
 
                 let read_pixels = |offset| {
                     let mut map_state;
@@ -983,7 +1043,7 @@ impl super::Queue {
                     glow::TEXTURE_2D => {
                         unsafe {
                             gl.framebuffer_texture_2d(
-                                glow::READ_FRAMEBUFFER,
+                                self.read_framebuffer(),
                                 glow::COLOR_ATTACHMENT0,
                                 src_target,
                                 Some(src),
@@ -995,7 +1055,7 @@ impl super::Queue {
                     glow::TEXTURE_2D_ARRAY => {
                         unsafe {
                             gl.framebuffer_texture_layer(
-                                glow::READ_FRAMEBUFFER,
+                                self.read_framebuffer(),
                                 glow::COLOR_ATTACHMENT0,
                                 Some(src),
                                 copy.texture_base.mip_level as i32,
@@ -1008,7 +1068,7 @@ impl super::Queue {
                         for z in copy.texture_base.origin.z..copy.size.depth {
                             unsafe {
                                 gl.framebuffer_texture_layer(
-                                    glow::READ_FRAMEBUFFER,
+                                    self.read_framebuffer(),
                                     glow::COLOR_ATTACHMENT0,
                                     Some(src),
                                     copy.texture_base.mip_level as i32,
@@ -1024,10 +1084,13 @@ impl super::Queue {
                     _ => unreachable!(),
                 }
             }
-            C::SetIndexBuffer(buffer) => {
-                unsafe { gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(buffer)) };
+            C::SetIndexBuffer(ref buffer) => {
+                unsafe { gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, buffer.raw) };
                 let mut current_index_buffer = self.current_index_buffer.lock();
-                *current_index_buffer = Some(buffer);
+                *current_index_buffer = buffer.raw;
+                if self.shared.is_gles2() {
+                    self.legacy_state.lock().index_buffer = Some(buffer.clone());
+                }
             }
             C::BeginQuery(query, target) => {
                 unsafe { gl.begin_query(target, query) };
@@ -1137,23 +1200,30 @@ impl super::Queue {
             }
             C::ResetFramebuffer { is_default } => {
                 if is_default {
-                    unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None) };
+                    unsafe { gl.bind_framebuffer(self.draw_framebuffer(), None) };
                 } else {
-                    unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.draw_fbo)) };
-                    unsafe {
-                        gl.framebuffer_texture_2d(
-                            glow::DRAW_FRAMEBUFFER,
-                            glow::DEPTH_STENCIL_ATTACHMENT,
-                            glow::TEXTURE_2D,
-                            None,
-                            0,
-                        )
+                    unsafe { gl.bind_framebuffer(self.draw_framebuffer(), Some(self.draw_fbo)) };
+                    let depth_attachments: &[u32] = if self.shared.is_gles2() {
+                        &[glow::DEPTH_ATTACHMENT, glow::STENCIL_ATTACHMENT]
+                    } else {
+                        &[glow::DEPTH_STENCIL_ATTACHMENT]
                     };
+                    for &attachment in depth_attachments {
+                        unsafe {
+                            gl.framebuffer_texture_2d(
+                                self.draw_framebuffer(),
+                                attachment,
+                                glow::TEXTURE_2D,
+                                None,
+                                0,
+                            )
+                        };
+                    }
                     for i in 0..self.shared.limits.max_color_attachments {
                         let target = glow::COLOR_ATTACHMENT0 + i;
                         unsafe {
                             gl.framebuffer_texture_2d(
-                                glow::DRAW_FRAMEBUFFER,
+                                self.draw_framebuffer(),
                                 target,
                                 glow::TEXTURE_2D,
                                 None,
@@ -1178,7 +1248,7 @@ impl super::Queue {
                 unsafe {
                     self.set_attachment(
                         gl,
-                        glow::DRAW_FRAMEBUFFER,
+                        self.draw_framebuffer(),
                         attachment,
                         view,
                         depth_slice,
@@ -1191,13 +1261,13 @@ impl super::Queue {
                 ref dst,
                 ref size,
             } => {
-                unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.draw_fbo)) };
+                unsafe { gl.bind_framebuffer(self.read_framebuffer(), Some(self.draw_fbo)) };
                 unsafe { gl.read_buffer(attachment) };
-                unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.copy_fbo)) };
+                unsafe { gl.bind_framebuffer(self.draw_framebuffer(), Some(self.copy_fbo)) };
                 unsafe {
                     self.set_attachment(
                         gl,
-                        glow::DRAW_FRAMEBUFFER,
+                        self.draw_framebuffer(),
                         glow::COLOR_ATTACHMENT0,
                         dst,
                         None,
@@ -1218,8 +1288,8 @@ impl super::Queue {
                         glow::NEAREST,
                     )
                 };
-                unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
-                unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.draw_fbo)) };
+                unsafe { gl.bind_framebuffer(self.read_framebuffer(), None) };
+                unsafe { gl.bind_framebuffer(self.draw_framebuffer(), Some(self.draw_fbo)) };
             }
             C::InvalidateAttachments(ref list) => {
                 if self
@@ -1227,11 +1297,14 @@ impl super::Queue {
                     .private_caps
                     .contains(PrivateCapabilities::INVALIDATE_FRAMEBUFFER)
                 {
-                    unsafe { gl.invalidate_framebuffer(glow::DRAW_FRAMEBUFFER, list) };
+                    unsafe { gl.invalidate_framebuffer(self.draw_framebuffer(), list) };
                 }
             }
             C::SetDrawColorBuffers(count) => {
                 self.draw_buffer_count.store(count, Ordering::Relaxed);
+                if self.shared.is_gles2() {
+                    return;
+                }
                 let indices = (0..count as u32)
                     .map(|i| glow::COLOR_ATTACHMENT0 + i)
                     .collect::<ArrayVec<_, { crate::MAX_COLOR_ATTACHMENTS }>>();
@@ -1242,7 +1315,12 @@ impl super::Queue {
                 ref color,
                 is_srgb,
             } => {
-                if self
+                if self.shared.is_gles2() {
+                    unsafe {
+                        gl.clear_color(color[0], color[1], color[2], color[3]);
+                        gl.clear(glow::COLOR_BUFFER_BIT);
+                    }
+                } else if self
                     .shared
                     .workarounds
                     .contains(super::Workarounds::MESA_I915_SRGB_SHADER_CLEAR)
@@ -1434,7 +1512,9 @@ impl super::Queue {
                             )
                         },
                     }
-                    unsafe { gl.vertex_attrib_divisor(vat.location, buffer_desc.step as u32) };
+                    if !self.shared.is_gles2() {
+                        unsafe { gl.vertex_attrib_divisor(vat.location, buffer_desc.step as u32) };
+                    }
                 }
             }
             C::UnsetVertexAttribute(location) => {
@@ -1488,6 +1568,23 @@ impl super::Queue {
             }
             C::SetProgram(program) => {
                 unsafe { gl.use_program(Some(program)) };
+                if self.shared.is_gles2() {
+                    self.legacy_state.lock().uniforms.clear();
+                }
+            }
+            C::SetPlainUniforms(ref uniforms) => {
+                self.legacy_state.lock().uniforms.clone_from(uniforms)
+            }
+            C::BindPlainUniform {
+                slot,
+                ref buffer,
+                offset,
+                size,
+            } => {
+                self.legacy_state
+                    .lock()
+                    .buffers
+                    .insert(slot, (buffer.clone(), offset, size));
             }
             C::SetPrimitive(ref state) => {
                 unsafe { gl.front_face(state.front_face) };
@@ -1600,8 +1697,26 @@ impl super::Queue {
             } => {
                 unsafe { gl.bind_buffer_range(target, slot, Some(buffer), offset, size) };
             }
-            C::BindSampler(texture_index, sampler) => {
-                unsafe { gl.bind_sampler(texture_index, sampler) };
+            C::BindSampler(texture_index, ref sampler) => {
+                if self.shared.is_gles2() {
+                    if let Some(parameters) =
+                        sampler.as_ref().and_then(|sampler| sampler.legacy.as_ref())
+                    {
+                        self.legacy_state
+                            .lock()
+                            .samplers
+                            .insert(texture_index, parameters.clone());
+                    } else {
+                        self.legacy_state.lock().samplers.remove(&texture_index);
+                    }
+                } else {
+                    unsafe {
+                        gl.bind_sampler(
+                            texture_index,
+                            sampler.as_ref().and_then(|sampler| sampler.raw),
+                        )
+                    };
+                }
             }
             C::BindTexture {
                 slot,
@@ -1612,6 +1727,14 @@ impl super::Queue {
             } => {
                 unsafe { gl.active_texture(glow::TEXTURE0 + slot) };
                 unsafe { gl.bind_texture(target, Some(texture)) };
+
+                if self.shared.is_gles2() {
+                    self.legacy_state
+                        .lock()
+                        .textures
+                        .insert(slot, (texture, target, mip_levels.end));
+                    return;
+                }
 
                 unsafe {
                     gl.tex_parameter_i32(target, glow::TEXTURE_BASE_LEVEL, mip_levels.start as i32)
@@ -1977,6 +2100,9 @@ impl crate::Queue for super::Queue {
             }
         }
 
+        if self.shared.is_gles2() {
+            unsafe { gl.finish() };
+        }
         signal_fence.maintain(gl);
         signal_fence.signal(gl, signal_value)?;
 

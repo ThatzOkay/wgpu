@@ -1,5 +1,7 @@
 use super::*;
 
+mod gles2;
+
 /// Writer responsible for all code generation.
 #[expect(missing_debug_implementations, reason = "would be way too verbose?")]
 pub struct Writer<'a, W> {
@@ -89,6 +91,7 @@ impl<'a, W: Write> Writer<'a, W> {
                 "gl_",                  // all GL built-in variables
                 "_group",               // all normal bindings
                 "_immediates_binding_", // all immediate data bindings
+                "naga_gles2_",
             ],
             &mut names,
         );
@@ -117,6 +120,9 @@ impl<'a, W: Write> Writer<'a, W> {
         };
 
         // Find all features required to print this module
+        if options.version.is_gles2() {
+            this.validate_gles2()?;
+        }
         this.collect_required_features()?;
 
         Ok(this)
@@ -149,8 +155,22 @@ impl<'a, W: Write> Writer<'a, W> {
         // TODO: Should this be user configurable?
         if es {
             writeln!(self.out)?;
-            writeln!(self.out, "precision highp float;")?;
-            writeln!(self.out, "precision highp int;")?;
+            if matches!(self.options.version, Version::Embedded { version: 100, .. })
+                && self.entry_point.stage == ShaderStage::Fragment
+            {
+                writeln!(self.out, "#ifdef GL_FRAGMENT_PRECISION_HIGH")?;
+                writeln!(self.out, "precision highp float;")?;
+                writeln!(self.out, "precision highp int;")?;
+                writeln!(self.out, "#define naga_gles2_precision highp")?;
+                writeln!(self.out, "#else")?;
+                writeln!(self.out, "precision mediump float;")?;
+                writeln!(self.out, "precision mediump int;")?;
+                writeln!(self.out, "#define naga_gles2_precision mediump")?;
+                writeln!(self.out, "#endif")?;
+            } else {
+                writeln!(self.out, "precision highp float;")?;
+                writeln!(self.out, "precision highp int;")?;
+            }
             writeln!(self.out)?;
         }
 
@@ -162,6 +182,10 @@ impl<'a, W: Write> Writer<'a, W> {
                 workgroup_size[0], workgroup_size[1], workgroup_size[2]
             )?;
             writeln!(self.out)?;
+        }
+
+        if self.options.version.is_gles2() {
+            self.write_gles2_helpers()?;
         }
 
         if self.entry_point.stage == ShaderStage::Vertex
@@ -514,6 +538,13 @@ impl<'a, W: Write> Writer<'a, W> {
             TypeInner::Matrix {
                 columns,
                 rows,
+                scalar: _,
+            } if self.options.version.is_gles2() && columns == rows => {
+                write!(self.out, "mat{}", columns as u8)?;
+            }
+            TypeInner::Matrix {
+                columns,
+                rows,
                 scalar,
             } => write!(
                 self.out,
@@ -601,11 +632,14 @@ impl<'a, W: Write> Writer<'a, W> {
             Ic::External => unimplemented!(),
         };
 
-        let precision = if self.options.version.is_es() {
-            "highp "
-        } else {
-            ""
-        };
+        let precision =
+            if self.options.version.is_gles2() && self.entry_point.stage == ShaderStage::Fragment {
+                "naga_gles2_precision "
+            } else if self.options.version.is_es() {
+                "highp "
+            } else {
+                ""
+            };
 
         write!(
             self.out,
@@ -632,6 +666,9 @@ impl<'a, W: Write> Writer<'a, W> {
         // Determine which (if any) explicit memory layout to use, and whether we support it
         let layout = match global.space {
             crate::AddressSpace::Uniform => {
+                if self.options.version.is_gles2() {
+                    return Ok(());
+                }
                 if !self.options.version.supports_std140_layout() {
                     return Err(Error::Custom(
                         "Uniform address space requires std140 layout support".to_string(),
@@ -729,7 +766,13 @@ impl<'a, W: Write> Writer<'a, W> {
                 self.write_simple_global(handle, global)?;
             }
             crate::AddressSpace::Uniform => {
-                self.write_interface_block(handle, global)?;
+                if self.options.version.is_gles2() {
+                    self.write_simple_global(handle, global)?;
+                    self.reflection_names_globals
+                        .insert(handle, self.get_global_name(handle, global));
+                } else {
+                    self.write_interface_block(handle, global)?;
+                }
             }
             crate::AddressSpace::Storage { .. } => {
                 self.write_interface_block(handle, global)?;
@@ -1123,6 +1166,14 @@ impl<'a, W: Write> Writer<'a, W> {
             }
         };
 
+        if matches!(self.options.version, Version::Embedded { version: 100, .. })
+            && self.entry_point.stage == ShaderStage::Fragment
+            && output
+            && location == 0
+        {
+            return Ok(());
+        }
+
         // Write the interpolation modifier if needed
         //
         // We ignore all interpolation and auxiliary modifiers that aren't used in fragment
@@ -1165,7 +1216,7 @@ impl<'a, W: Write> Writer<'a, W> {
 
         // Write the interpolation qualifier.
         if let Some(interp) = interpolation {
-            if emit_interpolation_and_auxiliary {
+            if emit_interpolation_and_auxiliary && !self.options.version.is_gles2() {
                 write!(self.out, "{} ", glsl_interpolation(interp))?;
             }
         }
@@ -1176,7 +1227,7 @@ impl<'a, W: Write> Writer<'a, W> {
         // immediately before the `in` / `out` qualifier, so we'll just follow that rule
         // here, regardless of the version.
         if let Some(sampling) = sampling {
-            if emit_interpolation_and_auxiliary {
+            if emit_interpolation_and_auxiliary && !self.options.version.is_gles2() {
                 if let Some(qualifier) = glsl_sampling(sampling)? {
                     write!(self.out, "{qualifier} ")?;
                 }
@@ -1184,7 +1235,19 @@ impl<'a, W: Write> Writer<'a, W> {
         }
 
         // Write the input/output qualifier.
-        write!(self.out, "{} ", if output { "out" } else { "in" })?;
+        let qualifier = if self.options.version.is_gles2() {
+            match self.entry_point.stage {
+                ShaderStage::Vertex if !output => "attribute",
+                ShaderStage::Vertex | ShaderStage::Fragment => "varying",
+                _ => unreachable!(),
+            }
+        } else if output {
+            "out"
+        } else {
+            "in"
+        };
+
+        write!(self.out, "{qualifier} ")?;
 
         // Write the type
         // `write_type` adds no leading or trailing spaces
@@ -1731,6 +1794,9 @@ impl<'a, W: Write> Writer<'a, W> {
                 selector,
                 ref cases,
             } => {
+                if self.options.version.is_gles2() {
+                    return self.write_gles2_switch(selector, cases, ctx, level);
+                }
                 let l2 = level.next();
                 // Some GLSL consumers may not handle switches with a single
                 // body correctly: See wgpu#4514. Write such switch statements
@@ -2393,6 +2459,11 @@ impl<'a, W: Write> Writer<'a, W> {
                 self.write_type(ty)?;
 
                 if let TypeInner::Array { base, size, .. } = self.module.types[ty].inner {
+                    if self.options.version.is_gles2() {
+                        return Err(Error::Custom(String::from(
+                            "GLSL ES 1.00 does not support array constructors",
+                        )));
+                    }
                     self.write_array_size(base, size)?;
                 }
 
@@ -2603,12 +2674,34 @@ impl<'a, W: Write> Writer<'a, W> {
                     && !self.features.contains(Features::TEXTURE_SHADOW_LOD);
 
                 // Write the function to be used depending on the sample level
-                let fun_name = match level {
-                    crate::SampleLevel::Zero if gather.is_some() => "textureGather",
-                    crate::SampleLevel::Zero if workaround_lod_with_grad => "textureGrad",
-                    crate::SampleLevel::Auto | crate::SampleLevel::Bias(_) => "texture",
-                    crate::SampleLevel::Zero | crate::SampleLevel::Exact(_) => "textureLod",
-                    crate::SampleLevel::Gradient { .. } => "textureGrad",
+                let fun_name = if matches!(
+                    self.options.version,
+                    Version::Embedded { version: 100, .. }
+                ) {
+                    if arrayed || depth_ref.is_some() || gather.is_some() || offset.is_some() {
+                        return Err(Error::Custom(String::from(
+                            "GLSL ES 1.00 does not support this texture sampling operation",
+                        )));
+                    }
+                    match (dim, level) {
+                        (crate::ImageDimension::D1 | crate::ImageDimension::D2, crate::SampleLevel::Auto | crate::SampleLevel::Bias(_)) => "texture2D",
+                        (crate::ImageDimension::Cube, crate::SampleLevel::Auto | crate::SampleLevel::Bias(_)) => "textureCube",
+                        (crate::ImageDimension::D1 | crate::ImageDimension::D2, crate::SampleLevel::Zero | crate::SampleLevel::Exact(_))
+                            if self.entry_point.stage == ShaderStage::Vertex => "texture2DLod",
+                        (crate::ImageDimension::Cube, crate::SampleLevel::Zero | crate::SampleLevel::Exact(_))
+                            if self.entry_point.stage == ShaderStage::Vertex => "textureCubeLod",
+                        _ => return Err(Error::Custom(String::from(
+                            "GLSL ES 1.00 does not support this texture dimension or sample level without extensions",
+                        ))),
+                    }
+                } else {
+                    match level {
+                        crate::SampleLevel::Zero if gather.is_some() => "textureGather",
+                        crate::SampleLevel::Zero if workaround_lod_with_grad => "textureGrad",
+                        crate::SampleLevel::Auto | crate::SampleLevel::Bias(_) => "texture",
+                        crate::SampleLevel::Zero | crate::SampleLevel::Exact(_) => "textureLod",
+                        crate::SampleLevel::Gradient { .. } => "textureGrad",
+                    }
                 };
                 let offset_name = match offset {
                     Some(_) => "Offset",
@@ -2990,7 +3083,15 @@ impl<'a, W: Write> Writer<'a, W> {
                         write!(self.out, " - ")?;
                         self.write_expr(right, ctx)?;
                         write!(self.out, " * ")?;
-                        write!(self.out, "trunc(")?;
+                        write!(
+                            self.out,
+                            "{}(",
+                            if self.options.version.is_gles2() {
+                                "naga_gles2_trunc"
+                            } else {
+                                "trunc"
+                            }
+                        )?;
                         self.write_expr(left, ctx)?;
                         write!(self.out, " / ")?;
                         self.write_expr(right, ctx)?;
@@ -3033,6 +3134,27 @@ impl<'a, W: Write> Writer<'a, W> {
                 accept,
                 reject,
             } => {
+                if self.options.version.is_gles2() {
+                    if let TypeInner::Vector { size, .. } =
+                        *ctx.resolve_type(condition, &self.module.types)
+                    {
+                        self.write_value_type(ctx.resolve_type(accept, &self.module.types))?;
+                        write!(self.out, "(")?;
+                        for index in 0..size as usize {
+                            if index != 0 {
+                                write!(self.out, ", ")?;
+                            }
+                            self.write_expr(condition, ctx)?;
+                            write!(self.out, ".{} ? ", back::COMPONENTS[index])?;
+                            self.write_expr(accept, ctx)?;
+                            write!(self.out, ".{} : ", back::COMPONENTS[index])?;
+                            self.write_expr(reject, ctx)?;
+                            write!(self.out, ".{}", back::COMPONENTS[index])?;
+                        }
+                        write!(self.out, ")")?;
+                        return Ok(());
+                    }
+                }
                 let cond_ty = ctx.resolve_type(condition, &self.module.types);
                 let vec_select = if let TypeInner::Vector { .. } = *cond_ty {
                     true
@@ -3111,6 +3233,12 @@ impl<'a, W: Write> Writer<'a, W> {
                 arg3,
             } => {
                 use crate::MathFunction as Mf;
+
+                if self.options.version.is_gles2()
+                    && self.write_gles2_math(fun, arg, arg1, arg2, ctx)?
+                {
+                    return Ok(());
+                }
 
                 let fun_name = match fun {
                     // comparison
@@ -4422,6 +4550,11 @@ impl<'a, W: Write> Writer<'a, W> {
                 write!(self.out, ")")?;
             }
             TypeInner::Array { base, size, .. } => {
+                if self.options.version.is_gles2() {
+                    return Err(Error::Custom(String::from(
+                        "GLSL ES 1.00 does not support array constructors",
+                    )));
+                }
                 let count = match size.resolve(self.module.to_ctx())? {
                     proc::IndexableLength::Known(count) => count,
                     proc::IndexableLength::Dynamic => return Ok(()),
@@ -4600,9 +4733,30 @@ impl<'a, W: Write> Writer<'a, W> {
             );
         }
 
+        let mut plain_uniforms = crate::FastHashMap::default();
+        if self.options.version.is_gles2() {
+            let mut layouter = proc::Layouter::default();
+            layouter.update(self.module.to_ctx()).unwrap();
+            for (&handle, name) in &uniforms {
+                let var = &self.module.global_variables[handle];
+                if var.space == crate::AddressSpace::Uniform {
+                    let mut items = Vec::new();
+                    self.collect_immediates_items(
+                        var.ty,
+                        &mut vec![name.clone()],
+                        &layouter,
+                        &mut 0,
+                        &mut items,
+                    );
+                    plain_uniforms.insert(handle, items);
+                }
+            }
+        }
+
         Ok(ReflectionInfo {
             texture_mapping,
             uniforms,
+            plain_uniforms,
             varying: mem::take(&mut self.varying),
             immediates_items,
             clip_distance_count: self.clip_distance_count,
@@ -4636,12 +4790,14 @@ impl<'a, W: Write> Writer<'a, W> {
                 *offset += layout.size;
             }
             // Arrays are recursed into.
-            TypeInner::Array { base, size, .. } => {
+            TypeInner::Array { base, size, stride } => {
                 let crate::ArraySize::Constant(count) = size else {
                     unreachable!("Cannot have dynamic arrays in immediates");
                 };
 
+                let start = *offset;
                 for i in 0..count.get() {
+                    *offset = start + i * stride;
                     // Add the array accessor and recurse.
                     segments.push(format!("[{i}]"));
                     self.collect_immediates_items(base, segments, layouter, offset, items);
@@ -4649,10 +4805,12 @@ impl<'a, W: Write> Writer<'a, W> {
                 }
 
                 // Ensure the stride is kept by rounding up to the alignment.
-                *offset = layout.alignment.round_up(*offset)
+                *offset = start + layout.size;
             }
             TypeInner::Struct { ref members, .. } => {
+                let start = *offset;
                 for (index, member) in members.iter().enumerate() {
+                    *offset = start + member.offset;
                     // Add struct accessor and recurse.
                     segments.push(format!(
                         ".{}",
@@ -4663,7 +4821,7 @@ impl<'a, W: Write> Writer<'a, W> {
                 }
 
                 // Ensure ending padding is kept by rounding up to the alignment.
-                *offset = layout.alignment.round_up(*offset)
+                *offset = start + layout.size;
             }
             _ => unreachable!(),
         }

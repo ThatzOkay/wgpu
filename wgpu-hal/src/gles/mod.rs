@@ -95,6 +95,7 @@ pub use self::egl::{AdapterContext, AdapterContextLock, Instance, Surface};
 mod emscripten;
 
 mod fence;
+mod legacy;
 mod queue;
 
 #[cfg(webgl)]
@@ -335,7 +336,7 @@ pub struct Adapter {
 #[derive(Debug)]
 pub struct Device {
     shared: Arc<AdapterShared>,
-    main_vao: glow::VertexArray,
+    main_vao: Option<glow::VertexArray>,
     #[cfg(all(native, feature = "renderdoc"))]
     render_doc: crate::auxil::renderdoc::RenderDoc,
     counters: Arc<wgt::HalCounters>,
@@ -344,7 +345,9 @@ pub struct Device {
 impl Drop for Device {
     fn drop(&mut self) {
         let gl = &self.shared.context.lock();
-        unsafe { gl.delete_vertex_array(self.main_vao) };
+        if let Some(vao) = self.main_vao {
+            unsafe { gl.delete_vertex_array(vao) };
+        }
     }
 }
 
@@ -369,6 +372,7 @@ pub struct Queue {
     temp_query_results: Mutex<Vec<u64>>,
     draw_buffer_count: AtomicU8,
     current_index_buffer: Mutex<Option<glow::Buffer>>,
+    legacy_state: Mutex<legacy::State>,
 }
 
 impl Drop for Queue {
@@ -599,9 +603,10 @@ pub struct TextureView {
 
 impl crate::DynTextureView for TextureView {}
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Sampler {
-    raw: glow::Sampler,
+    raw: Option<glow::Sampler>,
+    legacy: Option<legacy::SamplerParameters>,
 }
 
 impl crate::DynSampler for Sampler {}
@@ -657,6 +662,11 @@ enum RawBinding {
         offset: i32,
         size: i32,
     },
+    PlainUniform {
+        buffer: Buffer,
+        offset: i32,
+        size: i32,
+    },
     Texture {
         raw: glow::Texture,
         target: BindTarget,
@@ -665,7 +675,7 @@ enum RawBinding {
         //TODO: array layers
     },
     Image(ImageBinding),
-    Sampler(glow::Sampler),
+    Sampler(Sampler),
 }
 
 #[derive(Debug)]
@@ -752,6 +762,7 @@ struct PipelineInner {
     first_instance_location: Option<glow::UniformLocation>,
     immediates_descs: ArrayVec<ImmediateDesc, MAX_IMMEDIATES_COMMANDS>,
     clip_distance_count: u32,
+    plain_uniforms: Vec<(u8, ImmediateDesc)>,
 }
 
 #[cfg(send_sync)]
@@ -990,7 +1001,7 @@ enum Command {
         dst_target: BindTarget,
         copy: crate::BufferTextureCopy,
     },
-    SetIndexBuffer(glow::Buffer),
+    SetIndexBuffer(Buffer),
     BeginQuery(glow::Query, BindTarget),
     EndQuery(BindTarget),
     TimestampQuery(glow::Query),
@@ -1064,6 +1075,13 @@ enum Command {
         buffer_desc: VertexBufferDesc,
     },
     SetProgram(glow::Program),
+    SetPlainUniforms(Vec<(u8, ImmediateDesc)>),
+    BindPlainUniform {
+        slot: u8,
+        buffer: Buffer,
+        offset: i32,
+        size: i32,
+    },
     SetPrimitive(PrimitiveState),
     SetBlendConstant([f32; 4]),
     SetColorTarget {
@@ -1077,7 +1095,7 @@ enum Command {
         offset: i32,
         size: i32,
     },
-    BindSampler(u32, Option<glow::Sampler>),
+    BindSampler(u32, Option<Sampler>),
     BindTexture {
         slot: u32,
         texture: glow::Texture,

@@ -4981,6 +4981,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpu-example-04-gles2"
+version = "0.0.0"
+dependencies = [
+ "bytemuck",
+ "env_logger",
+ "pollster",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
 name = "wgpu-example-custom-backend"
 version = "0.0.0"
 dependencies = [

@@ -2814,6 +2814,10 @@ fn set_index_buffer(
 ) -> Result<(), RenderPassErrorInner> {
     api_log!("RenderPass::set_index_buffer {}", buffer.error_ident());
 
+    if device.is_gles2() && index_format == IndexFormat::Uint32 {
+        return Err(RenderCommandError::Unimplemented("32-bit indices on GLES 2.0").into());
+    }
+
     state
         .pass
         .scope

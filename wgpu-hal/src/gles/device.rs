@@ -29,6 +29,7 @@ struct CompilationContext<'a> {
     sampler_map: &'a mut super::SamplerBindMap,
     name_binding_map: &'a mut NameBindingMap,
     immediates_items: &'a mut Vec<naga::back::glsl::ImmediateItem>,
+    plain_uniform_items: &'a mut Vec<(u8, naga::back::glsl::ImmediateItem)>,
     multiview_mask: Option<NonZeroU32>,
     clip_distance_count: &'a mut u32,
 }
@@ -55,6 +56,12 @@ impl CompilationContext<'_> {
 
             let br = var.binding.as_ref().unwrap();
             let slot = self.layout.get_slot(br);
+
+            if let Some(items) = reflection_info.plain_uniforms.get(&handle) {
+                self.plain_uniform_items
+                    .extend(items.iter().cloned().map(|item| (slot, item)));
+                continue;
+            }
 
             let name = match reflection_info.uniforms.get(&handle) {
                 Some(name) => name.clone(),
@@ -537,6 +544,7 @@ impl super::Device {
         private_caps: PrivateCapabilities,
     ) -> Result<Arc<super::PipelineInner>, crate::PipelineError> {
         let glsl_version = match glsl_version {
+            naga::back::glsl::Version::Embedded { version: 100, .. } => String::from("100"),
             naga::back::glsl::Version::Embedded { version, .. } => format!("{version} es"),
             naga::back::glsl::Version::Desktop(version) => format!("{version}"),
         };
@@ -555,6 +563,7 @@ impl super::Device {
         let mut has_stages = wgt::ShaderStages::empty();
         let mut shaders_to_delete = ArrayVec::<_, { crate::MAX_CONCURRENT_SHADER_STAGES }>::new();
         let mut clip_distance_count = 0;
+        let mut plain_uniform_items = Vec::new();
 
         for &(naga_stage, stage) in &shaders {
             has_stages |= map_naga_stage(naga_stage);
@@ -567,6 +576,7 @@ impl super::Device {
                 sampler_map: &mut sampler_map,
                 name_binding_map: &mut name_binding_map,
                 immediates_items: pc_item,
+                plain_uniform_items: &mut plain_uniform_items,
                 multiview_mask,
                 clip_distance_count: &mut clip_distance_count,
             };
@@ -668,12 +678,29 @@ impl super::Device {
             None
         };
 
+        let plain_uniforms = plain_uniform_items
+            .into_iter()
+            .filter_map(|(slot, item)| {
+                let location = unsafe { gl.get_uniform_location(program, &item.access_path) }?;
+                Some((
+                    slot,
+                    super::ImmediateDesc {
+                        location,
+                        ty: item.ty,
+                        offset: item.offset,
+                        size_bytes: item.size_bytes,
+                    },
+                ))
+            })
+            .collect();
+
         Ok(Arc::new(super::PipelineInner {
             program,
             sampler_map,
             first_instance_location,
             immediates_descs: uniforms,
             clip_distance_count,
+            plain_uniforms,
         }))
     }
 }
@@ -700,7 +727,14 @@ impl crate::Device for super::Device {
                 .private_caps
                 .contains(PrivateCapabilities::BUFFER_ALLOCATION);
 
-        if emulate_map && desc.usage.intersects(wgt::BufferUses::MAP_WRITE) {
+        if emulate_map
+            && desc.usage.intersects(if self.shared.is_gles2() {
+                wgt::BufferUses::MAP_READ | wgt::BufferUses::MAP_WRITE
+            } else {
+                wgt::BufferUses::MAP_WRITE
+            })
+        {
+            self.counters.buffers.add(1);
             return Ok((
                 super::Buffer {
                     raw: None,
@@ -799,7 +833,9 @@ impl crate::Device for super::Device {
             }
         }
 
-        let data = if emulate_map && desc.usage.contains(wgt::BufferUses::MAP_READ) {
+        let data = if self.shared.is_gles2()
+            || (emulate_map && desc.usage.contains(wgt::BufferUses::MAP_READ))
+        {
             Some(vec![0; desc.size as usize])
         } else {
             None
@@ -861,8 +897,10 @@ impl crate::Device for super::Device {
                 let mut map_state = buffer.map_state.lock();
                 let ptr = if let Some(map_read_allocation) = map_state.data.as_mut() {
                     let slice = map_read_allocation.as_mut_slice();
-                    unsafe { self.shared.get_buffer_sub_data(gl, buffer.target, 0, slice) };
-                    slice.as_mut_ptr()
+                    if !self.shared.is_gles2() {
+                        unsafe { self.shared.get_buffer_sub_data(gl, buffer.target, 0, slice) };
+                    }
+                    slice[range.start as usize..].as_mut_ptr()
                 } else {
                     map_state.offset_of_current_mapping = range.start;
                     // glMapBufferRange throws an error if length is 0.
@@ -955,6 +993,7 @@ impl crate::Device for super::Device {
         let format_desc = self.shared.describe_texture_format(desc.format);
 
         let inner = if render_usage.contains(desc.usage)
+            && (!self.shared.is_gles2() || desc.format.is_depth_stencil_format())
             && desc.dimension == wgt::TextureDimension::D2
             && desc.size.depth_or_array_layers == 1
         {
@@ -1241,6 +1280,13 @@ impl crate::Device for super::Device {
         &self,
         desc: &crate::SamplerDescriptor,
     ) -> Result<super::Sampler, crate::DeviceError> {
+        if self.shared.is_gles2() {
+            self.counters.samplers.add(1);
+            return Ok(super::Sampler {
+                raw: None,
+                legacy: Some(super::legacy::SamplerParameters::new(desc)),
+            });
+        }
         let gl = &self.shared.context.lock();
 
         let raw = unsafe { gl.create_sampler().unwrap() };
@@ -1331,12 +1377,17 @@ impl crate::Device for super::Device {
 
         self.counters.samplers.add(1);
 
-        Ok(super::Sampler { raw })
+        Ok(super::Sampler {
+            raw: Some(raw),
+            legacy: None,
+        })
     }
 
     unsafe fn destroy_sampler(&self, sampler: super::Sampler) {
         let gl = &self.shared.context.lock();
-        unsafe { gl.delete_sampler(sampler.raw) };
+        if let Some(raw) = sampler.raw {
+            unsafe { gl.delete_sampler(raw) };
+        }
         self.counters.samplers.sub(1);
     }
 
@@ -1491,15 +1542,23 @@ impl crate::Device for super::Device {
             let binding = match layout.ty {
                 wgt::BindingType::Buffer { .. } => {
                     let bb = &desc.buffers[entry.resource_index as usize];
-                    super::RawBinding::Buffer {
-                        raw: bb.buffer.raw.unwrap(),
-                        offset: bb.offset as i32,
-                        size: bb.size.get() as i32,
+                    if self.shared.is_gles2() {
+                        super::RawBinding::PlainUniform {
+                            buffer: bb.buffer.clone(),
+                            offset: bb.offset as i32,
+                            size: bb.size.get() as i32,
+                        }
+                    } else {
+                        super::RawBinding::Buffer {
+                            raw: bb.buffer.raw.unwrap(),
+                            offset: bb.offset as i32,
+                            size: bb.size.get() as i32,
+                        }
                     }
                 }
                 wgt::BindingType::Sampler { .. } => {
                     let sampler = desc.samplers[entry.resource_index as usize];
-                    super::RawBinding::Sampler(sampler.raw)
+                    super::RawBinding::Sampler(sampler.clone())
                 }
                 wgt::BindingType::Texture { view_dimension, .. } => {
                     let view = desc.textures[entry.resource_index as usize].view;
@@ -1601,6 +1660,56 @@ impl crate::Device for super::Device {
             } => (vertex_stage, vertex_buffers),
             crate::VertexProcessor::Mesh { .. } => unreachable!(),
         };
+        if self.shared.is_gles2() {
+            for attribute in vertex_buffers
+                .iter()
+                .flatten()
+                .flat_map(|buffer| buffer.attributes)
+            {
+                let format = conv::describe_vertex_format(attribute.format);
+                if !matches!(
+                    format.element_format,
+                    glow::BYTE
+                        | glow::UNSIGNED_BYTE
+                        | glow::SHORT
+                        | glow::UNSIGNED_SHORT
+                        | glow::FLOAT
+                ) || format.element_count > 4
+                {
+                    return Err(crate::PipelineError::Linkage(
+                        wgt::ShaderStages::VERTEX,
+                        String::from("GLES 2.0 does not support this vertex attribute format"),
+                    ));
+                }
+            }
+            if desc
+                .color_targets
+                .iter()
+                .flatten()
+                .filter_map(|target| target.blend.as_ref())
+                .any(|blend| {
+                    [blend.color.operation, blend.alpha.operation]
+                        .iter()
+                        .any(|op| matches!(op, wgt::BlendOperation::Min | wgt::BlendOperation::Max))
+                })
+            {
+                return Err(crate::PipelineError::Linkage(
+                    wgt::ShaderStages::FRAGMENT,
+                    String::from("GLES 2.0 does not support min/max blending without extensions"),
+                ));
+            }
+        }
+        if self.shared.is_gles2()
+            && vertex_buffers
+                .iter()
+                .flatten()
+                .any(|buffer| buffer.step_mode == wgt::VertexStepMode::Instance)
+        {
+            return Err(crate::PipelineError::Linkage(
+                wgt::ShaderStages::VERTEX,
+                String::from("GLES 2.0 does not support instance vertex buffers"),
+            ));
+        }
         let gl = &self.shared.context.lock();
         let mut shaders = ArrayVec::new();
         shaders.push((naga::ShaderStage::Vertex, vertex_stage));
