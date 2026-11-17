@@ -764,6 +764,7 @@ fn generate_gles2(
 #[test]
 fn gles2_rejects_unsupported_shader_features() {
     for source in [
+        "@group(0) @binding(0) var<uniform> x: i32; @fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(bitcast<f32>(x)); }",
         "@fragment fn main() -> @location(0) vec4<f32> { let x = 1u; return vec4<f32>(f32(x)); }",
         "@fragment fn main(@location(0) x: f32) -> @location(0) vec4<f32> { return vec4<f32>(dpdx(x)); }",
         "@vertex fn main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> { return vec4<f32>(f32(index)); }",

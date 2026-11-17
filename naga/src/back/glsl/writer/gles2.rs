@@ -175,7 +175,7 @@ impl<W: Write> Writer<'_, W> {
                     {
                         return Err(unsupported("integer bitwise operations"))
                     }
-                    E::As { convert: None, .. } => return Err(unsupported("bitcasts")),
+                    E::Bitcast { .. } => return Err(unsupported("bitcasts")),
                     E::Relational {
                         fun: crate::RelationalFunction::IsInf | crate::RelationalFunction::IsNan,
                         ..
