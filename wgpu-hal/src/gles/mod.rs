@@ -806,6 +806,7 @@ struct ProgramStage {
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ProgramCacheKey {
+    force_point_size: bool,
     stages: ArrayVec<ProgramStage, 3>,
     group_to_binding_to_slot: Box<[Option<Box<[u8]>>]>,
 }

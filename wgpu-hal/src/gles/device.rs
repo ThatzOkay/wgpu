@@ -25,6 +25,7 @@ type ShaderStage<'a> = (
 type NameBindingMap = FastHashMap<String, (super::BindingRegister, u8)>;
 
 struct CompilationContext<'a> {
+    force_point_size: bool,
     layout: &'a super::PipelineLayout,
     sampler_map: &'a mut super::SamplerBindMap,
     name_binding_map: &'a mut NameBindingMap,
@@ -425,7 +426,13 @@ impl super::Device {
 
             let mut output = String::new();
             let needs_temp_options = stage.zero_initialize_workgroup_memory
-                != context.layout.naga_options.zero_initialize_workgroup_memory;
+                != context.layout.naga_options.zero_initialize_workgroup_memory
+                || context
+                    .layout
+                    .naga_options
+                    .writer_flags
+                    .contains(glsl::WriterFlags::FORCE_POINT_SIZE)
+                    != context.force_point_size;
             let mut temp_options;
             let naga_options = if needs_temp_options {
                 // We use a conditional here, as cloning the naga_options could be expensive
@@ -433,6 +440,10 @@ impl super::Device {
                 temp_options = context.layout.naga_options.clone();
                 temp_options.zero_initialize_workgroup_memory =
                     stage.zero_initialize_workgroup_memory;
+                temp_options.writer_flags.set(
+                    glsl::WriterFlags::FORCE_POINT_SIZE,
+                    context.force_point_size,
+                );
                 &temp_options
             } else {
                 &context.layout.naga_options
@@ -478,6 +489,7 @@ impl super::Device {
         layout: &super::PipelineLayout,
         #[cfg_attr(target_family = "wasm", allow(unused))] label: Option<&str>,
         multiview_mask: Option<NonZeroU32>,
+        force_point_size: bool,
     ) -> Result<Arc<super::PipelineInner>, crate::PipelineError> {
         let mut program_stages = ArrayVec::new();
         let group_to_binding_to_slot = layout
@@ -503,6 +515,7 @@ impl super::Device {
         // The only place that destroys a pipeline is also locking on `program_cache`
         let program = guard
             .entry(super::ProgramCacheKey {
+                force_point_size,
                 stages: program_stages,
                 group_to_binding_to_slot: group_to_binding_to_slot.into_boxed_slice(),
             })
@@ -515,6 +528,7 @@ impl super::Device {
                     multiview_mask,
                     self.shared.shading_language_version,
                     self.shared.private_caps,
+                    force_point_size,
                 )
             })
             .to_owned()?;
@@ -534,6 +548,7 @@ impl super::Device {
         buf
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn create_program<'a>(
         gl: &glow::Context,
         shaders: ArrayVec<ShaderStage<'a>, { crate::MAX_CONCURRENT_SHADER_STAGES }>,
@@ -542,6 +557,7 @@ impl super::Device {
         multiview_mask: Option<NonZeroU32>,
         glsl_version: naga::back::glsl::Version,
         private_caps: PrivateCapabilities,
+        force_point_size: bool,
     ) -> Result<Arc<super::PipelineInner>, crate::PipelineError> {
         let glsl_version = match glsl_version {
             naga::back::glsl::Version::Embedded { version: 100, .. } => String::from("100"),
@@ -572,6 +588,7 @@ impl super::Device {
                 immediates_items.last_mut().unwrap()
             };
             let context = CompilationContext {
+                force_point_size,
                 layout,
                 sampler_map: &mut sampler_map,
                 name_binding_map: &mut name_binding_map,
@@ -1445,8 +1462,7 @@ impl crate::Device for super::Device {
                 .private_caps
                 .contains(PrivateCapabilities::FULLY_FEATURED_INSTANCING),
         );
-        // We always force point size to be written and it will be ignored by the driver if it's not a point list primitive.
-        // https://github.com/gfx-rs/wgpu/pull/3440/files#r1095726950
+        // GLES 2 render pipelines override this default for non-point primitives.
         writer_flags.set(glsl::WriterFlags::FORCE_POINT_SIZE, true);
         let mut binding_map = glsl::BindingMap::default();
 
@@ -1717,7 +1733,15 @@ impl crate::Device for super::Device {
             shaders.push((naga::ShaderStage::Fragment, fs));
         }
         let inner = unsafe {
-            self.create_pipeline(gl, shaders, desc.layout, desc.label, desc.multiview_mask)
+            self.create_pipeline(
+                gl,
+                shaders,
+                desc.layout,
+                desc.label,
+                desc.multiview_mask,
+                !self.shared.is_gles2()
+                    || desc.primitive.topology == wgt::PrimitiveTopology::PointList,
+            )
         }?;
 
         let (vertex_buffers, vertex_attributes) = {
@@ -1813,7 +1837,8 @@ impl crate::Device for super::Device {
         let gl = &self.shared.context.lock();
         let mut shaders = ArrayVec::new();
         shaders.push((naga::ShaderStage::Compute, &desc.stage));
-        let inner = unsafe { self.create_pipeline(gl, shaders, desc.layout, desc.label, None) }?;
+        let inner =
+            unsafe { self.create_pipeline(gl, shaders, desc.layout, desc.label, None, true) }?;
 
         self.counters.compute_pipelines.add(1);
 
