@@ -383,6 +383,7 @@ By @alextechcc in [#8014](https://github.com/gfx-rs/wgpu/pull/8014).
 #### GLES
 
 - Enable `TEXTURE_CUBE_MAP_SEAMLESS` on desktop OpenGL so cube maps sample seamlessly across face edges, matching OpenGL ES 3.0+, WebGL 2, Vulkan, Metal, and Direct3D 12. By @kuntal-devrat in [#10628](https://github.com/gfx-rs/wgpu/pull/10628).
+- Emit automatic point size only for GLES 2 point-list pipelines, and distinguish point and non-point programs in the shader cache.
 - Fix black EGL surfaces on some platforms by selecting the default framebuffer's color buffer before presentation. By @valadaptive in [#10268](https://github.com/gfx-rs/wgpu/pull/10268).
 - Avoid duplicate `EGL_SURFACE_TYPE` attributes when selecting an EGL framebuffer configuration, which caused Mesa to return no matching configurations. By @BlueJayLouche and @scroix in [#10048](https://github.com/gfx-rs/wgpu/pull/10048).
 - `@interpolate(linear)` is now rejected by `Device::create_shader_module` on adapters that lack `DownlevelFlags::LINEAR_INTERPOLATION` (GLES/WebGL2), with a shader label and a source span. Previously such a shader validated fine and then failed at pipeline creation with `The selected version doesn't support Features(NOPERSPECTIVE_QUALIFIER)`. By @emilk in [#9972](https://github.com/gfx-rs/wgpu/pull/9972).
@@ -5096,20 +5097,17 @@ Manual concatenation of `cargo public-api --diff-git-checkouts v0.13.2 v0.14.0 -
 
 ```diff
 Removed items from the public API
-=================================
 -pub fn wgpu::Surface::get_supported_modes(&self, adapter: &wgpu::Adapter) -> Vec<PresentMode>
 -pub const wgpu::Features::DEPTH24UNORM_STENCIL8: Self
 -pub enum variant wgpu::TextureFormat::Depth24UnormStencil8
 
 Changed items in the public API
-===============================
 -pub unsafe fn wgpu::Instance::as_hal<A: wgc::hub::HalApi, F: FnOnce(Option<&<A as >::Instance>) -> R, R>(&self, hal_instance_callback: F) -> R
 +pub unsafe fn wgpu::Instance::as_hal<A: wgc::hub::HalApi>(&self) -> Option<&<A as >::Instance>
 -pub unsafe fn wgpu::Instance::create_surface<W: raw_window_handle::HasRawWindowHandle>(&self, window: &W) -> wgpu::Surface
 +pub unsafe fn wgpu::Instance::create_surface<W: raw_window_handle::HasRawWindowHandle + raw_window_handle::HasRawDisplayHandle>(&self, window: &W) -> wgpu::Surface
 
 Added items to the public API
-=============================
 +pub fn wgpu::Buffer::size(&self) -> wgt::BufferAddress
 +pub fn wgpu::Buffer::usage(&self) -> BufferUsages
 +pub fn wgpu::Surface::get_supported_alpha_modes(&self, adapter: &wgpu::Adapter) -> Vec<CompositeAlphaMode>
