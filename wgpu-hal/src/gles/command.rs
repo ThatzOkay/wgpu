@@ -25,7 +25,7 @@ pub(super) struct State {
     stencil: super::StencilState,
     depth_bias: wgt::DepthBiasState,
     alpha_to_coverage_enabled: bool,
-    samplers: [Option<glow::Sampler>; super::MAX_SAMPLERS],
+    samplers: [Option<super::Sampler>; super::MAX_SAMPLERS],
     texture_slots: [TextureSlotDesc; super::MAX_TEXTURE_SLOTS],
     render_size: wgt::Extent3d,
     resolve_attachments: ArrayVec<(u32, super::TextureView), { crate::MAX_COLOR_ATTACHMENTS }>,
@@ -199,7 +199,7 @@ impl super::CommandEncoder {
             {
                 let sampler = slot
                     .sampler_index
-                    .and_then(|si| self.state.samplers[si as usize]);
+                    .and_then(|si| self.state.samplers[si as usize].clone());
                 self.cmd_buffer
                     .commands
                     .push(C::BindSampler(texture_index as u32, sampler));
@@ -231,6 +231,11 @@ impl super::CommandEncoder {
 
     fn set_pipeline_inner(&mut self, inner: &super::PipelineInner) {
         self.cmd_buffer.commands.push(C::SetProgram(inner.program));
+        if !inner.plain_uniforms.is_empty() {
+            self.cmd_buffer
+                .commands
+                .push(C::SetPlainUniforms(inner.plain_uniforms.clone()));
+        }
 
         self.state
             .first_instance_location
@@ -779,9 +784,31 @@ impl crate::CommandEncoder for super::CommandEncoder {
                         size,
                     });
                 }
-                super::RawBinding::Sampler(sampler) => {
+                super::RawBinding::PlainUniform {
+                    ref buffer,
+                    mut offset,
+                    size,
+                } => {
+                    if matches!(
+                        binding_layout.ty,
+                        wgt::BindingType::Buffer {
+                            has_dynamic_offset: true,
+                            ..
+                        }
+                    ) {
+                        offset += dynamic_offsets[do_index] as i32;
+                        do_index += 1;
+                    }
+                    self.cmd_buffer.commands.push(C::BindPlainUniform {
+                        slot: slot as u8,
+                        buffer: buffer.clone(),
+                        offset,
+                        size,
+                    });
+                }
+                super::RawBinding::Sampler(ref sampler) => {
                     dirty_samplers |= 1 << slot;
-                    self.state.samplers[slot as usize] = Some(sampler);
+                    self.state.samplers[slot as usize] = Some(sampler.clone());
                 }
                 super::RawBinding::Texture {
                     raw,
@@ -1030,7 +1057,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
         self.state.index_format = format;
         self.cmd_buffer
             .commands
-            .push(C::SetIndexBuffer(binding.buffer.raw.unwrap()));
+            .push(C::SetIndexBuffer(binding.buffer.clone()));
     }
     unsafe fn set_vertex_buffer<'a>(
         &mut self,

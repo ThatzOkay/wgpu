@@ -210,6 +210,7 @@ By @alextechcc in [#8014](https://github.com/gfx-rs/wgpu/pull/8014).
 
 #### GLES
 
+- Add a native EGL GLES 2.0 rendering profile, GLSL ES 1.00 output, and `Limits::downlevel_gles2_defaults()`. Uniform buffers and samplers are emulated using ordinary uniforms and texture parameters. See the GLES 2.0 example for supported features and restrictions.
 - Add ANGLE as an opt-in OpenGL backend on Windows via `cfg(windows_angle)`, while keeping the `angle` feature for ANGLE on macOS/iOS. By @csmoe in [#9422](https://github.com/gfx-rs/wgpu/pull/9422).
 
 #### WebGL
@@ -249,6 +250,7 @@ By @alextechcc in [#8014](https://github.com/gfx-rs/wgpu/pull/8014).
 
 #### naga
 
+- Support GLSL ES 1.00 shader interfaces, ordinary uniforms, legacy texture sampling, switch lowering, and scalar and vector math fallbacks.
 - `naga::valid::ValidationError` is now always returned boxed, to avoid `clippy::large_result_err` warning. By @beicause in [#9612](https://github.com/gfx-rs/wgpu/pull/9612)
 - Added `naga::valid::Capabilities::LINEAR_INTERPOLATION`, which is now required in order to use `@interpolate(linear)`. By @emilk in [#9972](https://github.com/gfx-rs/wgpu/pull/9972).
 - The GLSL backend's `MissingFeatures` error now names the GLSL version that lacks the features, e.g. `GLSL 300 es doesn't support the required feature(s): NOPERSPECTIVE_QUALIFIER`. By @emilk in [#9972](https://github.com/gfx-rs/wgpu/pull/9972).

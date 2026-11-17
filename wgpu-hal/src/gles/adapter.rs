@@ -194,7 +194,7 @@ impl super::Adapter {
 
     pub(super) unsafe fn expose(
         context: super::AdapterContext,
-        backend_options: wgt::GlBackendOptions,
+        mut backend_options: wgt::GlBackendOptions,
     ) -> Option<crate::ExposedAdapter<super::Api>> {
         let gl = context.lock();
         let extensions = gl.supported_extensions();
@@ -251,9 +251,9 @@ impl super::Adapter {
         }
 
         if let Some(es_ver) = es_ver {
-            if es_ver < (3, 0) {
+            if es_ver < (2, 0) {
                 log::warn!(
-                    "Returned GLES context is {}.{}, when 3.0+ was requested",
+                    "Returned GLES context is {}.{}, when 2.0+ is needed",
                     es_ver.0,
                     es_ver.1
                 );
@@ -294,6 +294,11 @@ impl super::Adapter {
         };
 
         log::debug!("Supported GL Extensions: {extensions:#?}");
+
+        let gles2 = shading_language_version.is_gles2();
+        if gles2 {
+            backend_options.fence_behavior = wgt::GlFenceBehavior::AutoFinish;
+        }
 
         let supported = |(req_es_major, req_es_minor), (req_full_major, req_full_minor)| {
             let es_supported = es_ver
@@ -353,7 +358,11 @@ impl super::Adapter {
         } else {
             0
         };
-        let max_element_index = unsafe { gl.get_parameter_i32(glow::MAX_ELEMENT_INDEX) } as u32;
+        let max_element_index = if gles2 {
+            u16::MAX as u32
+        } else {
+            (unsafe { gl.get_parameter_i32(glow::MAX_ELEMENT_INDEX) }) as u32
+        };
 
         // WORKAROUND: In order to work around an issue with GL on RPI4 and similar, we ignore a
         // zero vertex ssbo count if there are vertex sstos. (more info:
@@ -742,19 +751,29 @@ impl super::Adapter {
         }
 
         let max_texture_size = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) } as u32;
-        let max_texture_3d_size = unsafe { gl.get_parameter_i32(glow::MAX_3D_TEXTURE_SIZE) } as u32;
+        let max_texture_3d_size = if gles2 {
+            0
+        } else {
+            (unsafe { gl.get_parameter_i32(glow::MAX_3D_TEXTURE_SIZE) }) as u32
+        };
 
-        let min_uniform_buffer_offset_alignment =
-            (unsafe { gl.get_parameter_i32(glow::UNIFORM_BUFFER_OFFSET_ALIGNMENT) } as u32);
+        let min_uniform_buffer_offset_alignment = if gles2 {
+            16
+        } else {
+            (unsafe { gl.get_parameter_i32(glow::UNIFORM_BUFFER_OFFSET_ALIGNMENT) }) as u32
+        };
         let min_storage_buffer_offset_alignment = if supports_storage {
             (unsafe { gl.get_parameter_i32(glow::SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT) } as u32)
         } else {
             256
         };
-        let max_uniform_buffers_per_shader_stage =
+        let max_uniform_buffers_per_shader_stage = if gles2 {
+            8
+        } else {
             unsafe { gl.get_parameter_i32(glow::MAX_VERTEX_UNIFORM_BLOCKS) }
                 .min(unsafe { gl.get_parameter_i32(glow::MAX_FRAGMENT_UNIFORM_BLOCKS) })
-                as u32;
+                as u32
+        };
 
         let max_compute_workgroups_per_dimension = if supports_work_group_params {
             unsafe { gl.get_parameter_indexed_i32(glow::MAX_COMPUTE_WORK_GROUP_COUNT, 0) }
@@ -765,9 +784,13 @@ impl super::Adapter {
             0
         };
 
-        let max_color_attachments = unsafe {
-            gl.get_parameter_i32(glow::MAX_COLOR_ATTACHMENTS)
-                .min(gl.get_parameter_i32(glow::MAX_DRAW_BUFFERS)) as u32
+        let max_color_attachments = if gles2 {
+            1
+        } else {
+            unsafe {
+                gl.get_parameter_i32(glow::MAX_COLOR_ATTACHMENTS)
+                    .min(gl.get_parameter_i32(glow::MAX_DRAW_BUFFERS)) as u32
+            }
         };
 
         // 16 bytes per sample is the maximum size of a color attachment.
@@ -778,9 +801,11 @@ impl super::Adapter {
             max_texture_dimension_1d: max_texture_size,
             max_texture_dimension_2d: max_texture_size,
             max_texture_dimension_3d: max_texture_3d_size,
-            max_texture_array_layers: unsafe {
-                gl.get_parameter_i32(glow::MAX_ARRAY_TEXTURE_LAYERS)
-            } as u32,
+            max_texture_array_layers: if gles2 {
+                6
+            } else {
+                (unsafe { gl.get_parameter_i32(glow::MAX_ARRAY_TEXTURE_LAYERS) }) as u32
+            },
             max_bind_groups: u32::MAX,
             // No limit.
             max_bind_groups_plus_vertex_buffers: u32::MAX,
@@ -788,8 +813,14 @@ impl super::Adapter {
             max_bindings_per_bind_group: u32::MAX,
             max_dynamic_uniform_buffers_per_pipeline_layout: max_uniform_buffers_per_shader_stage,
             max_dynamic_storage_buffers_per_pipeline_layout: max_storage_buffers_per_shader_stage,
-            max_sampled_textures_per_shader_stage: super::MAX_TEXTURE_SLOTS as u32,
-            max_samplers_per_shader_stage: super::MAX_SAMPLERS as u32,
+            max_sampled_textures_per_shader_stage: (unsafe {
+                gl.get_parameter_i32(glow::MAX_TEXTURE_IMAGE_UNITS)
+            } as u32)
+                .min(super::MAX_TEXTURE_SLOTS as u32),
+            max_samplers_per_shader_stage: (unsafe {
+                gl.get_parameter_i32(glow::MAX_TEXTURE_IMAGE_UNITS)
+            } as u32)
+                .min(super::MAX_SAMPLERS as u32),
             max_storage_buffers_per_shader_stage,
             max_storage_buffers_in_vertex_stage: 0,
             max_storage_buffers_in_fragment_stage: 0,
@@ -800,9 +831,14 @@ impl super::Adapter {
             max_binding_array_elements_per_shader_stage: 0,
             max_binding_array_sampler_elements_per_shader_stage: 0,
             max_binding_array_acceleration_structure_elements_per_shader_stage: 0,
-            max_uniform_buffer_binding_size: unsafe {
-                gl.get_parameter_i32(glow::MAX_UNIFORM_BLOCK_SIZE)
-            } as u64,
+            max_uniform_buffer_binding_size: if gles2 {
+                (unsafe { gl.get_parameter_i32(glow::MAX_VERTEX_UNIFORM_VECTORS) }
+                    .min(unsafe { gl.get_parameter_i32(glow::MAX_FRAGMENT_UNIFORM_VECTORS) })
+                    as u64)
+                    * 16
+            } else {
+                (unsafe { gl.get_parameter_i32(glow::MAX_UNIFORM_BLOCK_SIZE) }) as u64
+            },
             max_storage_buffer_binding_size: if supports_storage {
                 unsafe { gl.get_parameter_i32(glow::MAX_SHADER_STORAGE_BLOCK_SIZE) }
             } else {
@@ -851,16 +887,20 @@ impl super::Adapter {
             min_uniform_buffer_offset_alignment,
             min_storage_buffer_offset_alignment,
             max_inter_stage_shader_variables: {
-                // MAX_VARYING_COMPONENTS may return 0, because it is deprecated since OpenGL 3.2 core,
-                // and an OpenGL Context with the core profile and with forward-compatibility=true,
-                // will make deprecated constants unavailable.
-                let max_varying_components =
-                    unsafe { gl.get_parameter_i32(glow::MAX_VARYING_COMPONENTS) } as u32;
-                if max_varying_components == 0 {
-                    // default value for max_inter_stage_shader_variables
-                    15
+                if gles2 {
+                    (unsafe { gl.get_parameter_i32(glow::MAX_VARYING_VECTORS) }) as u32
                 } else {
-                    max_varying_components / 4
+                    // MAX_VARYING_COMPONENTS may return 0, because it is deprecated since OpenGL 3.2 core,
+                    // and an OpenGL Context with the core profile and with forward-compatibility=true,
+                    // will make deprecated constants unavailable.
+                    let max_varying_components =
+                        unsafe { gl.get_parameter_i32(glow::MAX_VARYING_COMPONENTS) } as u32;
+                    if max_varying_components == 0 {
+                        // default value for max_inter_stage_shader_variables
+                        15
+                    } else {
+                        max_varying_components / 4
+                    }
                 }
             },
             max_color_attachments,
@@ -927,7 +967,7 @@ impl super::Adapter {
 
         workarounds.set(
             super::Workarounds::EMULATE_BUFFER_MAP,
-            cfg!(any(webgl, Emscripten)),
+            cfg!(any(webgl, Emscripten)) || gles2,
         );
 
         let r = renderer.to_lowercase();
@@ -947,7 +987,24 @@ impl super::Adapter {
         }
 
         let downlevel_defaults = wgt::DownlevelLimits {};
-        let max_samples = unsafe { gl.get_parameter_i32(glow::MAX_SAMPLES) };
+        let max_samples = if gles2 {
+            1
+        } else {
+            unsafe { gl.get_parameter_i32(glow::MAX_SAMPLES) }
+        };
+        if gles2 {
+            private_caps &= super::PrivateCapabilities::DEBUG_FNS
+                | super::PrivateCapabilities::INDEX_BUFFER_ROLE_CHANGE;
+            downlevel_flags.remove(
+                wgt::DownlevelFlags::NON_POWER_OF_TWO_MIPMAPPED_TEXTURES
+                    | wgt::DownlevelFlags::COMPARISON_SAMPLERS
+                    | wgt::DownlevelFlags::SHADER_F16_IN_F32,
+            );
+            downlevel_flags.remove(
+                wgt::DownlevelFlags::ANISOTROPIC_FILTERING | wgt::DownlevelFlags::INDEPENDENT_BLEND,
+            );
+            features = wgt::Features::empty();
+        }
 
         // Drop the GL guard so we can move the context into AdapterShared
         // ( on Wasm the gl handle is just a ref so we tell clippy to allow
@@ -958,7 +1015,11 @@ impl super::Adapter {
         let downlevel = wgt::DownlevelCapabilities {
             flags: downlevel_flags,
             limits: downlevel_defaults,
-            shader_model: wgt::ShaderModel::Sm5,
+            shader_model: if gles2 {
+                wgt::ShaderModel::Sm2
+            } else {
+                wgt::ShaderModel::Sm5
+            },
         };
 
         features.set(
@@ -1103,9 +1164,14 @@ impl crate::Adapter for super::Adapter {
         let gl = &self.shared.context.lock();
         unsafe { gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1) };
         unsafe { gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1) };
-        let main_vao =
-            unsafe { gl.create_vertex_array() }.map_err(|_| crate::DeviceError::OutOfMemory)?;
-        unsafe { gl.bind_vertex_array(Some(main_vao)) };
+        let main_vao = if self.shared.is_gles2() {
+            None
+        } else {
+            let vao =
+                unsafe { gl.create_vertex_array() }.map_err(|_| crate::DeviceError::OutOfMemory)?;
+            unsafe { gl.bind_vertex_array(Some(vao)) };
+            Some(vao)
+        };
 
         // Desktop GL defaults to non-seamless cube sampling; ES 3.0+ and other backends are seamless by spec.
         if !self.shared.es {
@@ -1114,9 +1180,14 @@ impl crate::Adapter for super::Adapter {
 
         let zero_buffer =
             unsafe { gl.create_buffer() }.map_err(|_| crate::DeviceError::OutOfMemory)?;
-        unsafe { gl.bind_buffer(glow::COPY_READ_BUFFER, Some(zero_buffer)) };
+        let zero_target = if self.shared.is_gles2() {
+            glow::ARRAY_BUFFER
+        } else {
+            glow::COPY_READ_BUFFER
+        };
+        unsafe { gl.bind_buffer(zero_target, Some(zero_buffer)) };
         let zeroes = vec![0u8; super::ZERO_BUFFER_SIZE];
-        unsafe { gl.buffer_data_u8_slice(glow::COPY_READ_BUFFER, &zeroes, glow::STATIC_DRAW) };
+        unsafe { gl.buffer_data_u8_slice(zero_target, &zeroes, glow::STATIC_DRAW) };
 
         // Compile the shader program we use for doing manual clears to work around Mesa fastclear
         // bug.
@@ -1155,6 +1226,7 @@ impl crate::Adapter for super::Adapter {
                 temp_query_results: Mutex::new(Vec::new()),
                 draw_buffer_count: AtomicU8::new(1),
                 current_index_buffer: Mutex::new(None),
+                legacy_state: Mutex::new(Default::default()),
             },
         })
     }
@@ -1165,6 +1237,21 @@ impl crate::Adapter for super::Adapter {
     ) -> crate::TextureFormatCapabilities {
         use crate::TextureFormatCapabilities as Tfc;
         use wgt::TextureFormat as Tf;
+
+        if self.shared.is_gles2() {
+            return match format {
+                Tf::Rgba8Unorm => {
+                    Tfc::COPY_SRC
+                        | Tfc::COPY_DST
+                        | Tfc::SAMPLED
+                        | Tfc::SAMPLED_LINEAR
+                        | Tfc::COLOR_ATTACHMENT
+                        | Tfc::COLOR_ATTACHMENT_BLEND
+                }
+                Tf::Depth16Unorm | Tf::Stencil8 => Tfc::DEPTH_STENCIL_ATTACHMENT,
+                _ => Tfc::empty(),
+            };
+        }
 
         let sample_count = {
             let max_samples = self.shared.max_msaa_samples;
@@ -1387,6 +1474,9 @@ impl crate::Adapter for super::Adapter {
                 .contains(super::PrivateCapabilities::COLOR_BUFFER_HALF_FLOAT)
             {
                 formats.push(format_caps(wgt::TextureFormat::Rgba16Float))
+            }
+            if self.shared.is_gles2() {
+                formats.retain(|caps| caps.format == wgt::TextureFormat::Rgba8Unorm);
             }
 
             Some(crate::SurfaceCapabilities {

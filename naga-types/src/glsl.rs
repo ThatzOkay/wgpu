@@ -6,7 +6,7 @@ pub const FIRST_INSTANCE_BINDING: &str = "naga_vs_first_instance";
 /// List of supported `core` GLSL versions.
 pub const SUPPORTED_CORE_VERSIONS: &[u16] = &[140, 150, 330, 400, 410, 420, 430, 440, 450, 460];
 /// List of supported `es` GLSL versions.
-pub const SUPPORTED_ES_VERSIONS: &[u16] = &[300, 310, 320];
+pub const SUPPORTED_ES_VERSIONS: &[u16] = &[100, 300, 310, 320];
 
 /// A GLSL version.
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -20,6 +20,11 @@ pub enum Version {
 }
 
 impl Version {
+    /// Returns true when targeting GLSL ES 1.00 (OpenGL ES 2.0 or WebGL 1).
+    pub const fn is_gles2(&self) -> bool {
+        matches!(self, Self::Embedded { version: 100, .. })
+    }
+
     /// Create a new gles version
     pub const fn new_gles(version: u16) -> Self {
         Self::Embedded {
@@ -146,6 +151,7 @@ impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Version::Desktop(v) => write!(f, "{v} core"),
+            Version::Embedded { version: 100, .. } => write!(f, "100"),
             Version::Embedded { version: v, .. } => write!(f, "{v} es"),
         }
     }

@@ -1,0 +1,5 @@
+targets = "GLSL"
+
+[glsl]
+version.Embedded = { is_webgl = false, version = 100 }
+writer_flags = "ADJUST_COORDINATE_SPACE | FORCE_POINT_SIZE"

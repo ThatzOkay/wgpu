@@ -843,6 +843,10 @@ impl Device {
         &self.adapter
     }
 
+    pub(crate) fn is_gles2(&self) -> bool {
+        self.backend() == wgt::Backend::Gl && self.downlevel.shader_model == wgt::ShaderModel::Sm2
+    }
+
     /// Return true if `self` is still valid.
     ///
     /// Note that a `false` result here does *not* guarantee that no further activity will
@@ -1844,6 +1848,20 @@ impl Device {
             return Err(CreateTextureError::InvalidUsage(desc.usage));
         }
 
+        if self.is_gles2()
+            && desc.size.depth_or_array_layers != 1
+            && !(desc.dimension == wgt::TextureDimension::D2
+                && desc.size.depth_or_array_layers == 6
+                && desc.size.width == desc.size.height)
+        {
+            return Err(CreateTextureError::UnsupportedOnGles2("texture arrays"));
+        }
+        if desc.mip_level_count > 1
+            && (!desc.size.width.is_power_of_two() || !desc.size.height.is_power_of_two())
+        {
+            self.require_downlevel_flags(wgt::DownlevelFlags::NON_POWER_OF_TWO_MIPMAPPED_TEXTURES)?;
+        }
+
         conv::check_texture_dimension_size(
             desc.dimension,
             desc.size,
@@ -2461,6 +2479,12 @@ impl Device {
         desc: &resource::SamplerDescriptor,
     ) -> Result<Arc<Sampler>, resource::CreateSamplerError> {
         self.check_is_valid()?;
+
+        if self.is_gles2() && (desc.lod_min_clamp != 0.0 || desc.lod_max_clamp < 32.0) {
+            return Err(resource::CreateSamplerError::UnsupportedOnGles2(
+                "sampler LOD clamps",
+            ));
+        }
 
         if desc
             .address_modes
@@ -5624,6 +5648,10 @@ impl Device {
         use resource::CreateQuerySetError as Error;
 
         self.check_is_valid()?;
+
+        if self.is_gles2() {
+            return Err(Error::UnsupportedOnGles2);
+        }
 
         match desc.ty {
             wgt::QueryType::Occlusion => {}

@@ -1,0 +1,11 @@
+[package]
+name = "wgpu-example-04-gles2"
+edition = "2021"
+publish = false
+
+[dependencies]
+wgpu = { version = "30.0.0", default-features = false, features = ["gles", "wgsl", "std"] }
+pollster = "1.0"
+bytemuck = "1.25"
+env_logger = "0.11"
+winit = { version = "0.30.8", features = ["android-native-activity"] }
