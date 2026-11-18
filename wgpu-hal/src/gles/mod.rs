@@ -95,6 +95,7 @@ pub use self::egl::{AdapterContext, AdapterContextLock, Instance, Surface};
 mod emscripten;
 
 mod fence;
+mod frame_timing;
 mod legacy;
 mod queue;
 

@@ -205,12 +205,15 @@ impl EglContext {
 pub struct AdapterContext {
     glow: Mutex<ManuallyDrop<glow::Context>>,
     egl: Option<EglContext>,
+    gles2_sync: bool,
 }
 
 unsafe impl Sync for AdapterContext {}
 unsafe impl Send for AdapterContext {}
 
 impl AdapterContext {
+    pub(super) fn supports_gles2_sync(&self) -> bool { self.gles2_sync }
+
     pub fn is_owned(&self) -> bool {
         self.egl.is_some()
     }
@@ -1038,6 +1041,29 @@ impl crate::Instance for Instance {
             })
         };
 
+        let gles2_sync = gl.version().is_embedded
+            && gl.version().major == 2
+            && gl.supported_extensions().contains("GL_APPLE_sync")
+            && super::legacy::apple_sync_available(|name| {
+                inner.egl.instance.get_proc_address(name).is_some()
+            });
+        if gles2_sync {
+            gl = unsafe {
+                glow::Context::from_loader_function(|name| {
+                    let name = super::legacy::APPLE_SYNC_FUNCTIONS
+                        .iter()
+                        .find_map(|(core, apple)| (*core == name).then_some(*apple))
+                        .unwrap_or(name);
+                    inner
+                        .egl
+                        .instance
+                        .get_proc_address(name)
+                        .map_or(ptr::null(), |p| p as *const _)
+                })
+            };
+            log::info!("GLES 2: using GL_APPLE_sync fences instead of synchronous completion");
+        }
+
         // In contrast to OpenGL ES, OpenGL requires explicitly enabling sRGB conversions,
         // as otherwise the user has to do the sRGB conversion.
         if !gl.version().is_embedded && !matches!(inner.srgb_kind, SrgbFrameBufferKind::None) {
@@ -1068,6 +1094,7 @@ impl crate::Instance for Instance {
                     glow: Mutex::new(gl),
                     // ERROR: Copying owned reference handles here, be careful to not drop them!
                     egl: Some(inner.egl.clone()),
+                    gles2_sync,
                 },
                 self.options.clone(),
             )
@@ -1097,6 +1124,7 @@ impl super::Adapter {
                 AdapterContext {
                     glow: Mutex::new(ManuallyDrop::new(context)),
                     egl: None,
+                    gles2_sync: false,
                 },
                 options,
             )
@@ -1117,6 +1145,8 @@ impl super::Device {
 
 #[derive(Debug)]
 pub struct Swapchain {
+    swap_interval: i32,
+    interval_applied: core::sync::atomic::AtomicBool,
     surface: khronos_egl::Surface,
     wl_window: Option<*mut ffi::c_void>,
     framebuffer: glow::Framebuffer,
@@ -1145,11 +1175,23 @@ unsafe impl Send for Surface {}
 unsafe impl Sync for Surface {}
 
 impl Surface {
+    pub(super) fn supports_immediate(&self) -> bool {
+        self.egl
+            .instance
+            .get_config_attrib(
+                self.egl.display,
+                self.config,
+                khronos_egl::MIN_SWAP_INTERVAL,
+            )
+            .is_ok_and(|minimum| minimum == 0)
+    }
+
     pub(super) unsafe fn present(
         &self,
         _suf_texture: super::Texture,
         context: &AdapterContext,
     ) -> Result<(), crate::SurfaceError> {
+        let mut timing = super::frame_timing::Timer::new("egl_present");
         let gl = unsafe { context.get_without_egl_lock() };
         let swapchain = self.swapchain.read();
         let sc = swapchain.as_ref().ok_or(crate::SurfaceError::Other(
@@ -1169,9 +1211,24 @@ impl Surface {
                 crate::SurfaceError::Lost
             })?;
 
+        if !sc
+            .interval_applied
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            self.egl
+                .instance
+                .swap_interval(self.egl.display, sc.swap_interval)
+                .map_err(|error| {
+                    log::error!("swap_interval failed: {error}");
+                    crate::SurfaceError::Lost
+                })?;
+            sc.interval_applied
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+        }
         unsafe { gl.disable(glow::SCISSOR_TEST) };
         unsafe { gl.color_mask(true, true, true, true) };
 
+        timing.mark("context_setup");
         if let Some(presenter) = &sc.presenter {
             let (texture, _) = sc.image.as_native();
             unsafe { presenter.draw(&gl, texture, sc.extent) };
@@ -1211,6 +1268,9 @@ impl Surface {
             unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
         }
 
+        #[cfg(gles_with_std)]
+        unsafe { super::frame_timing::dump_frame(&gl, sc.extent) };
+        timing.mark("resolve_blit");
         self.egl
             .instance
             .swap_buffers(self.egl.display, sc.surface)
@@ -1219,6 +1279,7 @@ impl Surface {
                 crate::SurfaceError::Lost
                 // TODO: should we unset the current context here?
             })?;
+        timing.mark("swap_buffers");
         self.egl
             .instance
             .make_current(self.egl.display, None, None, None)
@@ -1492,6 +1553,13 @@ impl crate::Surface for Surface {
 
         let mut swapchain = self.swapchain.write();
         *swapchain = Some(Swapchain {
+            swap_interval: if config.present_mode == wgt::PresentMode::Immediate {
+                0
+            } else {
+                1
+            },
+            interval_applied: core::sync::atomic::AtomicBool::new(false),
+
             surface,
             wl_window,
             image,

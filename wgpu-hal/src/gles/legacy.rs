@@ -9,6 +9,7 @@ pub(super) struct State {
     pub textures: BTreeMap<u32, (glow::Texture, u32, u32)>,
     pub samplers: BTreeMap<u32, SamplerParameters>,
     pub index_buffer: Option<Buffer>,
+    applied_parameters: Vec<(glow::Texture, [u32; 4])>,
 }
 
 #[derive(Clone, Debug)]
@@ -184,7 +185,7 @@ impl Queue {
     }
 
     pub(super) unsafe fn prepare_gles2_draw(&self, gl: &glow::Context) {
-        let state = self.legacy_state.lock();
+        let mut state = self.legacy_state.lock();
         for (slot, uniform) in &state.uniforms {
             let Some((buffer, base, size)) = state.buffers.get(slot) else {
                 continue;
@@ -197,8 +198,14 @@ impl Queue {
             };
             unsafe { self.process(gl, &command, data.data.as_ref().unwrap(), &[]) };
         }
-        for (slot, &(texture, target, levels)) in &state.textures {
-            let Some(sampler) = state.samplers.get(slot) else {
+        let State {
+            textures,
+            samplers,
+            applied_parameters,
+            ..
+        } = &mut *state;
+        for (slot, &(texture, target, levels)) in textures.iter() {
+            let Some(sampler) = samplers.get(slot) else {
                 continue;
             };
             let min = if levels == 1 {
@@ -213,11 +220,44 @@ impl Queue {
             unsafe {
                 gl.active_texture(glow::TEXTURE0 + *slot);
                 gl.bind_texture(target, Some(texture));
-                gl.tex_parameter_i32(target, glow::TEXTURE_MIN_FILTER, min as i32);
-                gl.tex_parameter_i32(target, glow::TEXTURE_MAG_FILTER, sampler.mag as i32);
-                gl.tex_parameter_i32(target, glow::TEXTURE_WRAP_S, sampler.wrap[0] as i32);
-                gl.tex_parameter_i32(target, glow::TEXTURE_WRAP_T, sampler.wrap[1] as i32);
+                let parameters = [min, sampler.mag, sampler.wrap[0], sampler.wrap[1]];
+                let cached = applied_parameters.iter_mut().find(|(id, _)| *id == texture);
+                let changed = match cached {
+                    Some((_, previous)) if *previous == parameters => false,
+                    Some((_, previous)) => {
+                        *previous = parameters;
+                        true
+                    }
+                    None => {
+                        applied_parameters.push((texture, parameters));
+                        true
+                    }
+                };
+                if changed {
+                    gl.tex_parameter_i32(target, glow::TEXTURE_MIN_FILTER, min as i32);
+                    gl.tex_parameter_i32(target, glow::TEXTURE_MAG_FILTER, sampler.mag as i32);
+                    gl.tex_parameter_i32(target, glow::TEXTURE_WRAP_S, sampler.wrap[0] as i32);
+                    gl.tex_parameter_i32(target, glow::TEXTURE_WRAP_T, sampler.wrap[1] as i32);
+                }
             }
+        }
+    }
+
+    pub(super) unsafe fn copy_gles2_buffer(
+        &self,
+        gl: &glow::Context,
+        src: &Buffer,
+        dst: &Buffer,
+        copy: &crate::BufferCopy,
+    ) {
+        let range = copy.src_offset as usize..(copy.src_offset + copy.size.get()) as usize;
+        if Arc::ptr_eq(&src.map_state, &dst.map_state) {
+            let data = src.map_state.lock().data.as_ref().unwrap()[range].to_vec();
+            unsafe { self.write_gles2_buffer(gl, dst, copy.dst_offset as usize, &data) };
+        } else {
+            let source = src.map_state.lock();
+            let data = &source.data.as_ref().unwrap()[range];
+            unsafe { self.write_gles2_buffer(gl, dst, copy.dst_offset as usize, data) };
         }
     }
 
@@ -350,6 +390,33 @@ impl Presenter {
         unsafe {
             gl.delete_program(self.program);
             gl.delete_buffer(self.vertices);
+        }
+    }
+}
+
+#[cfg(all(not(webgl), any(not(windows), windows_angle)))]
+pub(super) const APPLE_SYNC_FUNCTIONS: &[(&str, &str)] = &[
+    ("glFenceSync", "glFenceSyncAPPLE"),
+    ("glIsSync", "glIsSyncAPPLE"),
+    ("glDeleteSync", "glDeleteSyncAPPLE"),
+    ("glClientWaitSync", "glClientWaitSyncAPPLE"),
+    ("glWaitSync", "glWaitSyncAPPLE"),
+    ("glGetInteger64v", "glGetInteger64vAPPLE"),
+    ("glGetSynciv", "glGetSyncivAPPLE"),
+];
+
+#[cfg(all(not(webgl), any(not(windows), windows_angle)))]
+pub(super) fn apple_sync_available(mut loaded: impl FnMut(&str) -> bool) -> bool {
+    APPLE_SYNC_FUNCTIONS.iter().all(|(_, name)| loaded(name))
+}
+
+#[cfg(all(test, not(webgl), any(not(windows), windows_angle)))]
+mod sync_tests {
+    #[test]
+    fn apple_sync_requires_every_entry_point() {
+        assert!(super::apple_sync_available(|_| true));
+        for (_, missing) in super::APPLE_SYNC_FUNCTIONS {
+            assert!(!super::apple_sync_available(|name| name != *missing));
         }
     }
 }

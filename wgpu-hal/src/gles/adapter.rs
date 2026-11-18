@@ -296,7 +296,11 @@ impl super::Adapter {
         log::debug!("Supported GL Extensions: {extensions:#?}");
 
         let gles2 = shading_language_version.is_gles2();
-        if gles2 {
+        #[cfg(all(not(webgl), any(not(windows), windows_angle)))]
+        let gles2_sync = context.supports_gles2_sync();
+        #[cfg(not(all(not(webgl), any(not(windows), windows_angle))))]
+        let gles2_sync = false;
+        if gles2 && !gles2_sync {
             backend_options.fence_behavior = wgt::GlFenceBehavior::AutoFinish;
         }
 
@@ -1468,10 +1472,16 @@ impl crate::Adapter for super::Adapter {
 
             Some(crate::SurfaceCapabilities {
                 formats,
-                present_modes: if cfg!(windows) {
-                    vec![wgt::PresentMode::Fifo, wgt::PresentMode::Immediate]
-                } else {
-                    vec![wgt::PresentMode::Fifo] //TODO
+                present_modes: {
+                    #[cfg(all(not(webgl), any(not(windows), windows_angle)))]
+                    let immediate = surface.supports_immediate();
+                    #[cfg(not(all(not(webgl), any(not(windows), windows_angle))))]
+                    let immediate = cfg!(windows);
+                    if immediate {
+                        vec![wgt::PresentMode::Fifo, wgt::PresentMode::Immediate]
+                    } else {
+                        vec![wgt::PresentMode::Fifo]
+                    }
                 },
                 composite_alpha_modes: vec![wgt::CompositeAlphaMode::Opaque], //TODO
                 maximum_frame_latency: 2..=2, //TODO, unused currently

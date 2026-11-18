@@ -211,10 +211,7 @@ impl super::Queue {
                     return;
                 }
                 C::CopyBufferToBuffer { src, dst, copy, .. } => {
-                    let data = src.map_state.lock().data.as_ref().unwrap()
-                        [copy.src_offset as usize..(copy.src_offset + copy.size.get()) as usize]
-                        .to_vec();
-                    unsafe { self.write_gles2_buffer(gl, dst, copy.dst_offset as usize, &data) };
+                    unsafe { self.copy_gles2_buffer(gl, src, dst, copy) };
                     return;
                 }
                 C::CopyBufferToTexture {
@@ -2062,8 +2059,10 @@ impl crate::Queue for super::Queue {
         _surface_textures: &[&super::Texture],
         (signal_fence, signal_value): (&super::Fence, crate::FenceValue),
     ) -> Result<(), crate::DeviceError> {
+        let mut timing = super::frame_timing::Timer::new("gl_submit");
         let shared = Arc::clone(&self.shared);
         let gl = &shared.context.lock();
+        timing.mark("context_lock");
         for cmd_buf in command_buffers.iter() {
             // The command encoder assumes a default state when encoding the command buffer.
             // Always reset the state between command_buffers to reflect this assumption. Do
@@ -2100,9 +2099,11 @@ impl crate::Queue for super::Queue {
             }
         }
 
-        if self.shared.is_gles2() {
+        timing.mark("command_replay");
+        if self.shared.is_gles2() && self.shared.options.fence_behavior.is_auto_finish() {
             unsafe { gl.finish() };
         }
+        timing.mark("finish_wait");
         signal_fence.maintain(gl);
         signal_fence.signal(gl, signal_value)?;
 
@@ -2110,6 +2111,7 @@ impl crate::Queue for super::Queue {
         // be signaled, particularly in headless contexts. Headed contexts will
         // often flush every so often, but headless contexts may not.
         unsafe { gl.flush() };
+        timing.mark("fence_flush");
 
         Ok(())
     }
